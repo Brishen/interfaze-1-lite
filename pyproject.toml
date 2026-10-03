@@ -1,0 +1,50 @@
+[project]
+name = "interfaze-1-lite"
+version = "0.1.0"
+description = "Interfaze 1 Lite: the whole model on one GPU, behind an OpenAI-compatible endpoint"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "httpx>=0.27",
+    "python-multipart>=0.0.12",
+    "rapidfuzz>=3.14",
+]
+
+[project.optional-dependencies]
+# GPU extras are installed in the Docker image, not for local contract work.
+serve = ["vllm==0.27.1"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/interfaze_lite"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = [".venv", "models"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "SIM", "C4", "RET", "ARG", "PIE", "PERF"]
+ignore = [
+    # Tool executors and test doubles must match a fixed signature, so an unused
+    # `args`/`ctx` is the interface working, not dead weight.
+    "ARG001", "ARG002",
+    # NamedTemporaryFile(delete=False) is deliberate: the file has to outlive the
+    # block that makes it, and the caller unlinks it in a finally.
+    "SIM115",
+    # Some secret stores expose the token as lowercase `hf_token`; renaming it to satisfy
+    # a naming rule would break every gated-repo download.
+    "SIM112",
+    # Long explanatory comments are load-bearing here -- several record a measured
+    # failure that would otherwise be reintroduced.
+    "E501",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

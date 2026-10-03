@@ -1,0 +1,28 @@
+services:
+  interfaze-1-lite:
+    build: .
+    image: interfaze-1-lite
+    ports: ["8000:8000"]
+    environment:
+      HF_TOKEN: ${HF_TOKEN:?set HF_TOKEN; the diarization and guard models are gated}
+      # Optional: require this key as "Authorization: Bearer <key>" on every request.
+      API_KEY: ${API_KEY:-}
+    volumes:
+      # Weights and compile caches live outside the image, so a code change does not
+      # re-download ~50 GB.
+      - ./models:/models
+      # Uncomment to point a capability at a different model (see components.env.example).
+      # - ./components.env:/app/components.env:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    # vLLM's processes share tensors through /dev/shm; Docker's 64 MB default breaks them.
+    ipc: host
+    restart: unless-stopped
+    # The first boot downloads ~50 GB before the endpoint answers.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      start_period: 3600s
+      retries: 3
