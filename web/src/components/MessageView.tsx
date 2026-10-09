@@ -63,18 +63,29 @@ function Stats({ message }: { message: AssistantMessage }) {
 
 export function AssistantView({ message, image }: { message: AssistantMessage; image?: string }) {
   const json = useMemo(() => (message.status === "done" ? parseJson(message.text) : undefined), [message.status, message.text]);
+  // A run task answers with `{name, result}`, the same result its tool card already
+  // holds. Shown once, as the answer, under the tool's own title.
+  const routed = useMemo(() => {
+    const r = json as { name?: unknown; result?: unknown } | undefined;
+    return r && typeof r === "object" && typeof r.name === "string" && "result" in r ? { name: r.name, result: r.result } : null;
+  }, [json]);
+  const tools = useMemo(() => {
+    if (!routed) return message.precontext;
+    const same = JSON.stringify(routed.result);
+    return message.precontext.filter((p) => JSON.stringify(p.result) !== same);
+  }, [message.precontext, routed]);
   const [open, setOpen] = useState(true);
   const waiting = message.status === "streaming" && !message.text;
 
   return (
     <div className="msg assistant">
-      {message.precontext.length > 0 && (
+      {tools.length > 0 && (
         <div className="tools">
           <button className="ghost small" onClick={() => setOpen((o) => !o)}>
-            {open ? "▾" : "▸"} {message.precontext.length} tool result{message.precontext.length > 1 ? "s" : ""}
+            {open ? "▾" : "▸"} {tools.length} tool result{tools.length > 1 ? "s" : ""}
           </button>
           {open &&
-            message.precontext.map((item, i) => (
+            tools.map((item, i) => (
               <ToolResult key={i} name={item.name} result={item.result} image={image} />
             ))}
         </div>
@@ -89,7 +100,9 @@ export function AssistantView({ message, image }: { message: AssistantMessage; i
           </span>
         </div>
       )}
-      {json !== undefined ? (
+      {routed ? (
+        <ToolResult name={routed.name} result={routed.result} image={image} />
+      ) : json !== undefined ? (
         <ToolResult name="answer" result={json} image={image} />
       ) : (
         message.text && (

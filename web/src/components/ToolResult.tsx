@@ -13,7 +13,9 @@ const TITLES: Record<string, string> = {
   gui_detection: "GUI grounding",
   translate: "Translation",
   forecast: "Forecast",
-  guard: "Guardrails",
+  text_guardrail_classifier: "Text guardrail",
+  image_guardrail_classifier: "Image guardrail",
+  answer: "Answer",
 };
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -49,6 +51,7 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
         <span className="tool-name">{TITLES[name] ?? name}</span>
         <code className="muted">{name}</code>
         {shapes.length > 0 && <span className="pill">{shapes.length} boxes</span>}
+        {typeof result === "string" && result.length < 40 && <span className="pill">{result}</span>}
         <div className="tabs">
           {views.map((v) => (
             <button key={v} className={v === view ? "tab active" : "tab"} onClick={() => setView(v)}>
