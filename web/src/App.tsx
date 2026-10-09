@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, buildBody, fetchHealth, fetchModel, splitPrecontext, streamChat, type Health } from "./api";
+import { ApiError, buildBody, fetchHealth, fetchModel, splitPrecontext, splitThinking, streamChat, type Health } from "./api";
 import { Composer } from "./components/Composer";
 import { AssistantView, UserView } from "./components/MessageView";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { uid } from "./ids";
+import { finish, onProgress, onText, onUpload, onUploaded } from "./steps";
 import { DEFAULT_SETTINGS, TASKS, type AssistantMessage, type Attachment, type Message, type Settings } from "./types";
 
 const SETTINGS_KEY = "interfaze-lite.settings";
@@ -86,6 +87,7 @@ export default function App() {
       role: "assistant",
       text: "",
       precontext: [],
+      steps: [],
       status: "streaming",
       startedAt: Date.now(),
     };
@@ -98,28 +100,50 @@ export default function App() {
     abort.current = ctrl;
     let raw = "";
     let firstTokenAt: number | undefined;
+    let steps = reply.steps;
     try {
       const body = buildBody(model, history, settings);
       for await (const event of streamChat(settings, body, ctrl.signal)) {
-        if (event.type === "content") {
-          raw += event.text;
-          const { text: prose, items } = splitPrecontext(raw);
-          if (prose && !firstTokenAt) firstTokenAt = Date.now();
-          update(reply.id, { text: prose, precontext: items, firstTokenAt });
-        } else {
-          update(reply.id, { finishReason: event.reason, usage: event.usage });
+        const now = Date.now();
+        switch (event.type) {
+          case "upload":
+            steps = onUpload(steps, event.sent, event.total, now);
+            update(reply.id, { steps });
+            break;
+          case "uploaded":
+            steps = onUploaded(steps, now);
+            update(reply.id, { steps });
+            break;
+          case "progress":
+            steps = onProgress(steps, event.event, now);
+            update(reply.id, { steps });
+            break;
+          case "content": {
+            raw += event.text;
+            const { text: content, items } = splitPrecontext(raw);
+            const { reasoning, answer: prose, thinking } = splitThinking(content);
+            if ((prose || reasoning) && !firstTokenAt) firstTokenAt = now;
+            if (prose) steps = onText(steps, now);
+            update(reply.id, { text: prose, reasoning, thinking, precontext: items, firstTokenAt, steps });
+            break;
+          }
+          case "finish":
+            update(reply.id, { finishReason: event.reason, usage: event.usage });
+            break;
         }
       }
-      update(reply.id, { status: "done", finishedAt: Date.now() });
+      const now = Date.now();
+      update(reply.id, { status: "done", finishedAt: now, steps: finish(steps, now) });
     } catch (e) {
+      const now = Date.now();
       if (ctrl.signal.aborted) {
-        update(reply.id, { status: "stopped", finishedAt: Date.now() });
+        update(reply.id, { status: "stopped", finishedAt: now, steps: finish(steps, now, true) });
       } else {
         const message =
           e instanceof ApiError
             ? e.message
             : `Could not reach the server (${(e as Error).message}). Is it running, and is the server URL right?`;
-        update(reply.id, { status: "error", error: message, finishedAt: Date.now() });
+        update(reply.id, { status: "error", error: message, finishedAt: now, steps: finish(steps, now, true) });
       }
     } finally {
       setBusy(false);

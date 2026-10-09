@@ -8,6 +8,7 @@ SSE framing -- against fixtures instead of a GPU.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import types
 
@@ -2526,3 +2527,90 @@ def test_a_structured_reply_that_does_not_parse_is_drawn_again(client_for, monke
         "messages": [{"role": "user", "content": "hi"}], "response_format": schema}).json()
     assert json.loads(body["choices"][0]["message"]["content"]) == {"title": "Interfaze"}
     assert len([p for p in fake.tool_payloads if p.get("response_format")]) == 2
+
+
+def _progress_stream(client, body, headers=None):
+    with client.stream("POST", "/v1/chat/completions", json=body,
+                       headers={"x-interfaze-progress": "true", **(headers or {})}) as resp:
+        raw = "".join(resp.iter_text())
+    events = [json.loads(line[len(": progress "):])
+              for line in raw.splitlines() if line.startswith(": progress ")]
+    chunks = [json.loads(line[6:]) for line in raw.splitlines()
+              if line.startswith("data: ") and line[6:].strip() != "[DONE]"]
+    return resp, raw, events, chunks
+
+
+def test_a_watched_request_reports_each_tool_as_it_runs(client_for):
+    fake = Fake([
+        brain_body(tool_calls=[{"id": "c1", "type": "function", "function": {
+            "name": "ocr", "arguments": json.dumps({"file_ref_id": "ref-0"})}}]),
+        brain_body("The invoice total is 42.00."),
+    ])
+    client = client_for(fake)
+    resp, raw, events, chunks = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is the total?"},
+            {"type": "file", "file": {"file_data": "data:image/png;base64,"
+                                      + base64.b64encode(_PNG_800x600).decode(),
+                                      "filename": "invoice.png"}},
+        ]}]})
+
+    assert resp.status_code == 200
+    stages = [e["stage"] for e in events]
+    assert stages[0] == "received" and events[0]["files"] == 1
+    assert stages.index("model") < stages.index("tool_start") < stages.index("tool_end")
+    start = next(e for e in events if e["stage"] == "tool_start")
+    end = next(e for e in events if e["stage"] == "tool_end")
+    assert start["tool"] == "ocr" and start["detail"] == "invoice.png" and start["id"] == "c1"
+    assert end["ok"] is True and end["ms"] >= 0
+    # The answer is the same stream it always was, around the comments.
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    assert text == "The invoice total is 42.00."
+    assert raw.rstrip().endswith("data: [DONE]")
+
+
+def test_progress_is_only_sent_to_a_caller_that_asks(client_for):
+    fake = Fake([brain_body("hi")])
+    client = client_for(fake)
+    with client.stream("POST", "/v1/chat/completions", json={
+            "stream": True, "messages": [{"role": "user", "content": "hello"}]}) as resp:
+        raw = "".join(resp.iter_text())
+    assert ": progress" not in raw
+
+
+def test_a_watched_request_refused_up_front_keeps_its_status(client_for):
+    client = client_for(Fake([]))
+    resp = client.post("/v1/chat/completions", headers={"x-interfaze-progress": "true"},
+                       json={"stream": True, "messages": "not a list"})
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+
+
+def test_a_watched_structured_answer_reports_the_schema_fill(client_for):
+    fake = Fake([brain_body()])
+    client = client_for(fake)
+    resp, _, events, chunks = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": "give me a"}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "r", "schema": {"type": "object", "properties": {"a": {"type": "number"}}}}}})
+    assert resp.status_code == 200
+    assert "structuring" in [e["stage"] for e in events]
+    assert "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks) == '{"a":1}'
+
+
+def test_a_json_answer_after_progress_goes_in_band():
+    from fastapi.responses import JSONResponse
+    failed = app_module._json_as_stream(
+        JSONResponse(status_code=502, content={"error": {"message": "boom"}}), False)
+    assert json.loads(failed[0][6:]) == {"error": {"message": "boom"}}
+    assert failed[-1] == "data: [DONE]\n\n"
+
+    done = app_module._json_as_stream(JSONResponse({
+        "id": "req-1", "created": 1, "model": "m", "usage": {"total_tokens": 3},
+        "precontext": [{"name": "ocr", "result": {}}],
+        "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    }), True)
+    deltas = [json.loads(c[6:])["choices"][0] for c in done[:-1]]
+    assert deltas[1]["delta"]["content"].startswith("<precontext> ")
+    assert deltas[2]["delta"]["content"] == "hi"
+    assert deltas[-1]["finish_reason"] == "stop"

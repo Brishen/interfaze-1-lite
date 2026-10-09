@@ -25,11 +25,31 @@ export type UserMessage = {
   attachments: Attachment[];
 };
 
+/** One stage of working out an answer, as the progress list shows it. */
+export type Step = {
+  key: string;
+  label: string;
+  detail?: string;
+  state: "running" | "done" | "failed";
+  startedAt: number;
+  endedAt?: number;
+  /** Bytes sent and to send, for the upload. */
+  sent?: number;
+  total?: number;
+  /** Runs alongside its siblings rather than after them (a tool call). */
+  parallel?: boolean;
+};
+
 export type AssistantMessage = {
   id: string;
   role: "assistant";
   text: string;
   precontext: PrecontextItem[];
+  steps: Step[];
+  /** The model's reasoning, when it was asked to reason. */
+  reasoning?: string;
+  /** Still reasoning: the reasoning is open and the answer has not begun. */
+  thinking?: boolean;
   status: "streaming" | "done" | "error" | "stopped";
   error?: string;
   finishReason?: string;

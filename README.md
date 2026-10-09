@@ -164,6 +164,16 @@ print(res.choices[0].message.content)
 
 Each specialist's full result comes back next to the answer, in the response's `precontext` field.
 
+To follow a long request while it runs, send `stream: true` with the header `x-interfaze-progress: true`. The stream then also carries SSE comment lines, which OpenAI SDKs and other SSE clients skip, one per step as it happens:
+
+```
+: progress {"stage":"model","step":1,"after_tools":false}
+: progress {"stage":"tool_start","id":"call_1","tool":"ocr","detail":"invoice.pdf"}
+: progress {"stage":"tool_end","id":"call_1","tool":"ocr","ms":18423,"ok":true}
+```
+
+The stages are `received`, `guard`, `model`, `tool_start`, `tool_end`, `structuring`, `reasoning` and `writing`. The web UI shows these as a live list of steps.
+
 To run one capability and get its raw result, name it as a task in the system message:
 
 ```bash
