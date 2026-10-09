@@ -80,6 +80,8 @@ class Fake:
         self.transcribe_payloads: list[dict] = []
         self.guard_output = "safe"
         self.guard_payloads: list[dict] = []
+        # What a schema-constrained call returns: a structured answer, or a translation.
+        self.structured_reply = '{"a":1}'
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -131,7 +133,7 @@ class Fake:
                                       headers={"content-type": "text/event-stream"})
             if payload.get("response_format"):
                 self.tool_payloads.append(payload)
-                return httpx.Response(200, json=brain_body('{"a":1}'))
+                return httpx.Response(200, json=brain_body(self.structured_reply))
             self.tool_payloads.append(payload)
             turn = self.brain_turns.pop(0)
             return turn if isinstance(turn, httpx.Response) else httpx.Response(200, json=turn)
@@ -2691,3 +2693,75 @@ def test_a_cut_off_call_goes_back_to_the_model_as_valid_json(client_for):
     assert call["function"] == {"name": "translate", "arguments": "{}"}
     result = next(m for m in history if m.get("role") == "tool")
     assert CUT_OFF_CALL in result["content"]
+
+
+def _translate_call(target="en", text="Guten Morgen, wie geht es Ihnen?", call_id="t1"):
+    return {"id": call_id, "type": "function", "function": {"name": "translate", "arguments": json.dumps(
+        {"text": text, "target_language": target, "current_language": "de"})}}
+
+
+def _streamed_answer(client, prompt):
+    with client.stream("POST", "/v1/chat/completions", json={
+            "stream": True, "messages": [{"role": "user", "content": prompt}]}) as resp:
+        raw = "".join(resp.iter_text())
+    return "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                   for line in raw.splitlines()
+                   if line.startswith("data: ") and line[6:].strip() != "[DONE]")
+
+
+def test_a_translation_is_the_answer_as_the_tool_returned_it(client_for):
+    """Not retyped by the model: an 18-page translation took two minutes that way and
+    stopped mid-sentence at the output limit."""
+    from interfaze_lite.prompts import TRANSLATION_SHOWN
+
+    fake = Fake([brain_body(tool_calls=[_translate_call()]),
+                 brain_body("Here is the English translation:")])
+    fake.structured_reply = json.dumps({"translated_text": "Good morning, how are you?"})
+    client = client_for(fake)
+
+    answer = _streamed_answer(client, "translate 'Guten Morgen, wie geht es Ihnen?' into English")
+    assert answer == "Here is the English translation:\n\nGood morning, how are you?"
+    tool_message = next(m for m in fake.stream_payloads[-1]["messages"] if m.get("role") == "tool")
+    assert TRANSLATION_SHOWN in tool_message["content"]
+
+
+def test_a_translation_with_nothing_said_is_the_whole_answer(client_for):
+    fake = Fake([brain_body(tool_calls=[_translate_call()]), brain_body("")])
+    fake.structured_reply = json.dumps({"translated_text": "Good morning, how are you?"})
+    client = client_for(fake)
+
+    assert _streamed_answer(client, "translate this into English: Guten Morgen") == \
+        "Good morning, how are you?"
+    # No second answer was generated to fill the silence.
+    assert len(fake.stream_payloads) == 2
+
+
+def test_a_translation_the_model_retyped_is_not_added_twice(client_for):
+    fake = Fake([brain_body(tool_calls=[_translate_call()]),
+                 brain_body("Good morning, how are you?")])
+    fake.structured_reply = json.dumps({"translated_text": "Good morning, how are you?"})
+    client = client_for(fake)
+
+    assert _streamed_answer(client, "translate into English: Guten Morgen") == \
+        "Good morning, how are you?"
+
+
+def test_a_buffered_answer_carries_the_translation_too(client_for):
+    fake = Fake([brain_body(tool_calls=[_translate_call()]), brain_body("")])
+    fake.structured_reply = json.dumps({"translated_text": "Good morning, how are you?"})
+    client = client_for(fake)
+
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate into English: Guten Morgen"}]})
+    assert resp.json()["choices"][0]["message"]["content"] == "Good morning, how are you?"
+
+
+def test_several_translations_are_labelled_by_language():
+    from interfaze_lite.envelope import PrecontextItem
+
+    items = [PrecontextItem("translate", {"translated_text": "駅はどこですか？", "target_language": "ja"}),
+             PrecontextItem("translate", {"translated_text": "Kituo kiko wapi?", "target_language": "sw"}),
+             PrecontextItem("ocr", {"extracted_text": "not a translation"})]
+    shown = app_module._shown_translations(items, "Here they are:")
+    assert shown.startswith("\n\n**Japanese**\n\n駅はどこですか？")
+    assert "**Swahili**\n\nKituo kiko wapi?" in shown and "not a translation" not in shown
