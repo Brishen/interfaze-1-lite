@@ -224,3 +224,4 @@ __marimo__/
 components.env
 # Weights and caches mounted into the container.
 /models/
+llamacpp/logs/

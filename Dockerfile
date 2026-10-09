@@ -7,7 +7,7 @@
 # Build:  docker build -t interfaze-1-lite .
 # Run:    docker run --gpus all --ipc=host -p 8000:8000 -e HF_TOKEN=hf_... -v ./models:/models interfaze-1-lite
 #
-# HF_TOKEN is required: the diarization and guard models are gated on Hugging Face, and an
+# HF_TOKEN is required: the diarization model is gated on Hugging Face, and an
 # anonymous download returns 401. Accept their terms on huggingface.co first.
 
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
@@ -65,7 +65,7 @@ ENV PYTHONPATH=/app \
     DIARIZE_URL=http://127.0.0.1:8003 \
     OCR_VLM_URL=http://127.0.0.1:8004 \
     BRAIN_SERVED_NAME=interfaze-lite \
-    PERCEPTION_PRELOAD=asr_fallback,segmenter,guard,forecaster \
+    PERCEPTION_PRELOAD=asr_fallback,segmenter,forecaster \
     MAX_TOOL_STEPS=8 \
     ENABLE_FAST_ASR=0 \
     BRAIN_SPEC_TOKENS=3

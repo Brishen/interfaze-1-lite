@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 # which capabilities exist without naming what provides them.
 _CAPABILITIES = (
     "brain", "segmenter", "ocr_vlm", "asr", "asr_fallback", "diarizer",
-    "layout", "line_detector", "line_recognizer", "guard", "forecaster",
+    "layout", "line_detector", "line_recognizer", "forecaster",
 )
 
 DEFAULT_COMPONENTS: dict[str, str] = {

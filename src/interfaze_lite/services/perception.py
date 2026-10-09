@@ -149,10 +149,6 @@ class TranscribeRequest(BaseModel):
     # deployments that are deliberately independent.
 
 
-class GuardRequest(BaseModel):
-    text: str = ""
-
-
 class ForecastRequest(BaseModel):
     # interfaze's prediction payload: the horizon, and the series as date -> value.
     fh: int
@@ -167,7 +163,6 @@ CAPABILITY = {
     "ocr_vlm": "document_reading",
     "diarizer": "diarization",
     "brain": "reasoning",
-    "guard": "guardrails",
     "forecaster": "forecasting",
 }
 
@@ -301,23 +296,9 @@ def transcribe(req: TranscribeRequest) -> dict[str, Any]:
     return result
 
 
-# One at a time, like transcription: each is a short GPU pass on a card other models
-# share, and serialising them keeps their peak allocation to one request's.
-_guard_lock = threading.Lock()
+# One at a time, like transcription: a short GPU pass on a card other models share, and
+# serialising it keeps its peak allocation to one request's.
 _forecast_lock = threading.Lock()
-
-
-@app.post("/guard")
-def guard(req: GuardRequest) -> dict[str, Any]:
-    _collect_failure()
-    try:
-        with _guard_lock:
-            return model().moderate(req.text)
-    except Exception as exc:
-        _free_vram()
-        _failed.set()
-        log.exception("guard failed")
-        raise HTTPException(status_code=500, detail=f"guard failed: {_describe(exc)}") from exc
 
 
 @app.post("/forecast")

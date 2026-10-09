@@ -86,6 +86,13 @@ class Fake:
 
         if path.endswith("/v1/chat/completions"):
             payload = json.loads(request.content)
+            # The text guard: the brain, asked to classify the latest user message.
+            first = (payload.get("messages") or [{}])[0].get("content")
+            if isinstance(first, str) and first.startswith("Task: Check if there is unsafe content"):
+                text = first.split("<BEGIN USER MESSAGE>\n", 1)[1].split("\n<END USER MESSAGE>", 1)[0]
+                self.guard_payloads.append({"text": text})
+                return httpx.Response(200, json={**brain_body(self.guard_output),
+                                                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}})
             # Grounding: an image and no tool results. Answer turns carry the caller's
             # image too, once a tool has read it. It streams, as brain.ground asks.
             if any(isinstance(m.get("content"), list)
@@ -128,10 +135,6 @@ class Fake:
             turn = self.brain_turns.pop(0)
             return turn if isinstance(turn, httpx.Response) else httpx.Response(200, json=turn)
 
-        if path.endswith("/guard"):
-            self.guard_payloads.append(json.loads(request.content))
-            return httpx.Response(200, json={"output": self.guard_output,
-                                             "prompt_tokens": 10, "completion_tokens": 2})
         if path.endswith("/ocr"):
             if isinstance(self.ocr, httpx.Response):
                 return self.ocr

@@ -30,7 +30,7 @@ from typing import Any
 
 import httpx
 
-from . import grounding
+from . import grounding, guard
 from .config import Settings
 from .contracts import InputFetchError
 from .envelope import ToolCall
@@ -44,6 +44,22 @@ class ContextLengthError(ValueError):
 
 class BrainError(RuntimeError):
     pass
+
+
+# How each server says the prompt does not fit: vLLM, then llama-server (message, then
+# error type).
+_CONTEXT_ERRORS = ("maximum context length", "exceeds the available context size",
+                   "exceed_context_size_error")
+
+
+def _context_error(status: int, text: str) -> ContextLengthError | None:
+    if status != 400 or not any(marker in text for marker in _CONTEXT_ERRORS):
+        return None
+    try:
+        message = json.loads(text).get("error", {}).get("message") or text
+    except (ValueError, AttributeError):
+        message = text
+    return ContextLengthError(message[:800])
 
 
 # This model's chat template accepts only these three levels and raises outright on
@@ -126,21 +142,70 @@ class BrainClient:
     def __init__(self, http: httpx.AsyncClient, settings: Settings):
         self.http = http
         self.settings = settings
+        # Remote images already inlined for llama-server, by URL. A tool loop sends the
+        # same conversation several times; this keeps it to one download per image.
+        self._inlined: dict[str, str] = {}
+
+    async def _adapt(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The request as the configured server can take it. vLLM takes it as it is."""
+        if not self.settings.llamacpp:
+            return payload
+        payload = dict(payload)
+        # llama-server reads tool_choice as a string only; a named function is silently
+        # read as "auto", so the forced first turn was not forced. Offering only that
+        # function and requiring a call is the same constraint.
+        choice = payload.get("tool_choice")
+        if isinstance(choice, dict):
+            name = (choice.get("function") or {}).get("name")
+            named = [t for t in payload.get("tools") or []
+                     if (t.get("function") or {}).get("name") == name]
+            if named:
+                payload["tools"] = named
+            payload["tool_choice"] = "required"
+        if "messages" in payload:
+            payload["messages"] = [await self._inline_message(m) for m in payload["messages"]]
+        return payload
+
+    async def _inline_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        """The message with every remote image as a data URI.
+
+        llama-server downloads an http(s) image_url itself, without the browser
+        User-Agent several CDNs insist on, and a failed download fails the whole turn.
+        Fetched here instead, as _image_bytes fetches everything else.
+        """
+        content = message.get("content")
+        if not isinstance(content, list) or not any(
+                isinstance(p, dict) and p.get("type") == "image_url"
+                and str((p.get("image_url") or {}).get("url", "")).startswith(("http://", "https://"))
+                for p in content):
+            return message
+        parts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                parts.append(part)
+                continue
+            url = str((part.get("image_url") or {}).get("url", ""))
+            if url.startswith(("http://", "https://")):
+                if url not in self._inlined:
+                    if len(self._inlined) >= 32:
+                        self._inlined.pop(next(iter(self._inlined)))
+                    raw = await self._image_bytes(url)
+                    self._inlined[url] = await asyncio.to_thread(_data_uri, raw)
+                part = {**part, "image_url": {**part["image_url"], "url": self._inlined[url]}}
+            parts.append(part)
+        return {**message, "content": parts}
 
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = await self._adapt(payload)
         resp = await self.http.post(
             self.settings.brain_chat_url,
             json={"model": self.settings.brain_served_name, **payload},
             timeout=self.settings.request_timeout_s,
         )
-        if resp.status_code == 400 and "maximum context length" in resp.text:
-            # The caller's input is too long for the model: their error, which a 502 told
-            # them to retry.
-            try:
-                message = resp.json().get("error", {}).get("message") or resp.text
-            except ValueError:
-                message = resp.text
-            raise ContextLengthError(message[:800])
+        # The caller's input is too long for the model: their error, which a 502 told
+        # them to retry.
+        if (too_long := _context_error(resp.status_code, resp.text)) is not None:
+            raise too_long
         if resp.status_code >= 400:
             raise BrainError(f"brain returned {resp.status_code}: {resp.text[:800]}")
         return resp.json()
@@ -151,14 +216,17 @@ class BrainClient:
         Consume it under `contextlib.aclosing`: closing it closes the connection, which
         is how a caller that stops early makes vLLM abort the generation.
         """
+        payload = await self._adapt(payload)
         async with self.http.stream(
             "POST", self.settings.brain_chat_url,
             json={"model": self.settings.brain_served_name, **payload, "stream": True},
             timeout=self.settings.request_timeout_s,
         ) as resp:
             if resp.status_code >= 400:
-                body = (await resp.aread()).decode(errors="replace")[:800]
-                raise BrainError(f"brain returned {resp.status_code}: {body}")
+                body = (await resp.aread()).decode(errors="replace")
+                if (too_long := _context_error(resp.status_code, body)) is not None:
+                    raise too_long
+                raise BrainError(f"brain returned {resp.status_code}: {body[:800]}")
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -557,6 +625,20 @@ class BrainClient:
                 "gore": clamp(scores.get("gore_score")),
                 "prompt_tokens": reply.prompt_tokens, "completion_tokens": reply.completion_tokens}
 
+    async def text_safety(self, text: str) -> dict[str, Any]:
+        """The guard's verdict on one user message, from the brain itself.
+
+        `output` is in Llama Guard's format -- "safe", or "unsafe" and the violated codes
+        on the next line -- which is what guard.verdict reads. The brain answers the
+        same S1-S14 taxonomy a separate guard model was prompted with, so there is no
+        guard model to load.
+        """
+        reply = await self.synthesise(
+            [{"role": "user", "content": guard.check_prompt(text)}],
+            sampling=Sampling(max_tokens=24, temperature=0))
+        return {"output": guard.parse_check(reply.content),
+                "prompt_tokens": reply.prompt_tokens, "completion_tokens": reply.completion_tokens}
+
     async def healthy(self) -> bool:
         try:
             resp = await self.http.get(f"{self.settings.brain_url.rstrip('/')}/health", timeout=5)
@@ -639,6 +721,20 @@ def _png_uri(image) -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def _data_uri(raw: bytes) -> str:
+    """Image bytes as a data URI, typed by what they decode as."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    try:
+        mime = Image.MIME.get(Image.open(io.BytesIO(raw)).format or "", "image/png")
+    except Exception as exc:
+        raise InputFetchError(f"not an image ({type(exc).__name__})") from exc
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
 
 def _inline_local_file(path: str) -> str:

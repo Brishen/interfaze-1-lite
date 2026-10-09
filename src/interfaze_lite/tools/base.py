@@ -89,7 +89,7 @@ log = logging.getLogger("interfaze.tools")
 
 # What each internal service does, in the words a caller would use.
 _CAPABILITIES = {"/transcribe": "speech to text", "/diarize": "speaker detection", "/ocr": "OCR",
-                 "/segment": "segmentation", "/forecast": "forecasting", "/guard": "the guardrail check"}
+                 "/segment": "segmentation", "/forecast": "forecasting"}
 
 
 async def _post(ctx: ToolContext, base: str, path: str, payload: dict) -> dict:
