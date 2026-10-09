@@ -3,6 +3,7 @@ import { ApiError, buildBody, fetchHealth, fetchModel, splitPrecontext, streamCh
 import { Composer } from "./components/Composer";
 import { AssistantView, UserView } from "./components/MessageView";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { uid } from "./ids";
 import { DEFAULT_SETTINGS, TASKS, type AssistantMessage, type Attachment, type Message, type Settings } from "./types";
 
 const SETTINGS_KEY = "interfaze-lite.settings";
@@ -79,9 +80,9 @@ export default function App() {
   }, []);
 
   const send = async (text: string, attachments: Attachment[]) => {
-    const user: Message = { id: crypto.randomUUID(), role: "user", text, attachments };
+    const user: Message = { id: uid(), role: "user", text, attachments };
     const reply: AssistantMessage = {
-      id: crypto.randomUUID(),
+      id: uid(),
       role: "assistant",
       text: "",
       precontext: [],

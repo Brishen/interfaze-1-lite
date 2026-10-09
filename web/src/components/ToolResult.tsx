@@ -28,6 +28,22 @@ function clock(s: number | undefined): string {
   return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`;
 }
 
+/** The clipboard API exists only in secure contexts; plain HTTP falls back to execCommand. */
+function copy(text: string) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+    return;
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
 type View = "overlay" | "transcript" | "forecast" | "json";
 
 /** One tool's result: drawn over the image when it has boxes, tabulated when it is a transcript or series. */
@@ -97,7 +113,7 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
         )}
         {view === "json" && (
           <div className="json">
-            <button className="ghost small copy" onClick={() => navigator.clipboard.writeText(json)}>
+            <button className="ghost small copy" onClick={() => copy(json)}>
               Copy
             </button>
             <pre>{json.length > 400_000 ? `${json.slice(0, 400_000)}\n… (truncated)` : json}</pre>
