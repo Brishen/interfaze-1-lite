@@ -50,8 +50,7 @@ export function hasRichView(result: unknown, image?: string): boolean {
   return (
     (!!image && collectShapes(result).length > 0) ||
     (Array.isArray(record?.chunks) && record!.chunks.length > 0) ||
-    (Array.isArray(record?.predictions) && record!.predictions.length > 0) ||
-    (typeof record?.translated_text === "string" && !!record.translated_text.trim())
+    (Array.isArray(record?.predictions) && record!.predictions.length > 0)
   );
 }
 

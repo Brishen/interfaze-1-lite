@@ -51,6 +51,10 @@ class ToolContext:
     # finishing -- for a caller that asked to watch it (`x-interfaze-progress`). None
     # otherwise, and then nothing is reported.
     progress: Callable[[dict], None] | None = None
+    # A translation that ran is put into the answer as the tool returned it, rather than
+    # retyped by the model (see `_shown_translations` in app.py). Off where the answer is
+    # built another way: a schema to fill, or a routed task's raw result.
+    shows_translations: bool = False
 @dataclass
 class ToolResult:
     model_facing: dict[str, Any]

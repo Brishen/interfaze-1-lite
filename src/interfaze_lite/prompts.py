@@ -88,6 +88,13 @@ CUT_OFF_CALL = ("This call was cut off at the output token limit before its argu
                 "pass a file by file_ref_id, and leave out data that is written in the "
                 "user's message.")
 
+# A translation the answer will carry verbatim. Retyped by the model, an 18-page document's
+# translation took two minutes and stopped mid-sentence at the output token limit.
+TRANSLATION_SHOWN = ("The user is shown this translation in full, exactly as it is here, directly "
+                     "after your reply. Do not repeat any of it. Reply with at most one short "
+                     "sentence introducing it, or with whatever else the user asked for besides "
+                     "the translation itself.")
+
 # The same, when the server could not return the cut-off call at all (llama-server fails
 # the response instead), so there is no call to answer and the note goes in a user turn.
 CUT_OFF_TURN = ("Your last tool call was cut off at the output token limit before its "
