@@ -1,3 +1,4 @@
+import { uid } from "./ids";
 import type { Attachment } from "./types";
 
 /** The server's own per-request ceiling is generous; this keeps a browser tab responsive. */
@@ -21,7 +22,7 @@ export async function toAttachment(file: File): Promise<Attachment> {
   const mime = (file.type || "application/octet-stream").split(";")[0];
   const kind = mime.startsWith("image/") ? "image" : mime.startsWith("audio/") ? "audio" : "file";
   return {
-    id: crypto.randomUUID(),
+    id: uid(),
     name: file.name,
     mime,
     size: file.size,

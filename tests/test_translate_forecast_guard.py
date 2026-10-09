@@ -104,6 +104,42 @@ class TestTranslateTool:
         assert result.model_facing["translated_text"] == ["ONE TWO", "THREE"]
         assert result.model_facing["batch_size"] == 2
 
+    def test_an_attached_document_is_translated_from_the_file(self, monkeypatch):
+        """By reference: copied into `text`, a long document ran past the output limit."""
+        from interfaze_lite.tools import ocr as ocr_tool
+        from interfaze_lite.tools.base import ToolResult
+
+        read = []
+
+        async def fake_ocr(args, ctx):
+            read.append(args)
+            return ToolResult(model_facing={"extracted_text": "short view"},
+                              full={"extracted_text": "Guten Morgen"})
+
+        async def structured(messages, schema, sampling):
+            assert "Original Text: Guten Morgen" in messages[1]["content"]
+            return SimpleNamespace(content=json.dumps({"translated_text": "Good morning"}),
+                                   prompt_tokens=1, completion_tokens=1)
+
+        monkeypatch.setattr(ocr_tool.OCR, "execute", fake_ocr)
+        result = asyncio.run(tools.dispatch("translate", json.dumps(
+            {"file_ref_id": "ref-0", "target_language": "en", "current_language": "de"}),
+            _ctx(structured=structured)))
+        assert read == [{"file_ref_id": "ref-0"}]
+        assert result.model_facing["translated_text"] == "Good morning"
+
+    def test_a_document_with_no_text_is_said_to_have_none(self, monkeypatch):
+        from interfaze_lite.tools import ocr as ocr_tool
+        from interfaze_lite.tools.base import ToolResult
+
+        async def fake_ocr(args, ctx):
+            return ToolResult(model_facing={"extracted_text": ""}, full={"extracted_text": ""})
+
+        monkeypatch.setattr(ocr_tool.OCR, "execute", fake_ocr)
+        result = asyncio.run(tools.dispatch("translate", json.dumps(
+            {"file_ref_id": "ref-0", "target_language": "en"}), _ctx()))
+        assert result.model_facing["error"] == "No text was found in this file"
+
     def test_unknown_language_and_same_language_are_refused(self):
         result = asyncio.run(tools.dispatch("translate", json.dumps(
             {"text": "hi", "target_language": "xx"}), _ctx()))

@@ -28,7 +28,34 @@ function clock(s: number | undefined): string {
   return `${m}:${(s - m * 60).toFixed(1).padStart(4, "0")}`;
 }
 
-type View = "overlay" | "transcript" | "forecast" | "json";
+/** The clipboard API exists only in secure contexts; plain HTTP falls back to execCommand. */
+function copy(text: string) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+    return;
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
+}
+
+/** Whether a result has more to show than its JSON: boxes to draw, a transcript, a series. */
+export function hasRichView(result: unknown, image?: string): boolean {
+  const record = asRecord(result);
+  return (
+    (!!image && collectShapes(result).length > 0) ||
+    (Array.isArray(record?.chunks) && record!.chunks.length > 0) ||
+    (Array.isArray(record?.predictions) && record!.predictions.length > 0) ||
+    (typeof record?.translated_text === "string" && !!record.translated_text.trim())
+  );
+}
+
+type View = "overlay" | "transcript" | "forecast" | "text" | "json";
 
 /** One tool's result: drawn over the image when it has boxes, tabulated when it is a transcript or series. */
 export function ToolResult({ name, result, image }: { name: string; result: unknown; image?: string }) {
@@ -36,11 +63,16 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
   const record = asRecord(result);
   const chunks = Array.isArray(record?.chunks) ? (record!.chunks as Chunk[]) : null;
   const predictions = Array.isArray(record?.predictions) ? (record!.predictions as Prediction[]) : null;
+  // Text worth reading as text: a translation, or a document's reading.
+  const text = [record?.translated_text, record?.extracted_text].find(
+    (t): t is string | string[] => (typeof t === "string" && !!t.trim()) || (Array.isArray(t) && t.length > 0),
+  );
 
   const views: View[] = [];
   if (image && shapes.length) views.push("overlay");
   if (chunks?.length) views.push("transcript");
   if (predictions?.length) views.push("forecast");
+  if (text) views.push("text");
   views.push("json");
   const [view, setView] = useState<View>(views[0]);
   const json = useMemo(() => JSON.stringify(result, null, 2), [result]);
@@ -95,9 +127,17 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
             </tbody>
           </table>
         )}
+        {view === "text" && text && (
+          <div className="json">
+            <button className="ghost small copy" onClick={() => copy(Array.isArray(text) ? text.join("\n\n") : text)}>
+              Copy
+            </button>
+            <pre className="plain">{Array.isArray(text) ? text.join("\n\n") : text}</pre>
+          </div>
+        )}
         {view === "json" && (
           <div className="json">
-            <button className="ghost small copy" onClick={() => navigator.clipboard.writeText(json)}>
+            <button className="ghost small copy" onClick={() => copy(json)}>
               Copy
             </button>
             <pre>{json.length > 400_000 ? `${json.slice(0, 400_000)}\n… (truncated)` : json}</pre>

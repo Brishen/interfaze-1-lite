@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -23,14 +24,21 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import forecasting
 from . import guard as guardrails
 from . import intent
 from . import tools as toolkit
-from .brain import STRUCTURED_MAX_TEMPERATURE, BrainClient, BrainError, ContextLengthError, Sampling
+from .brain import (
+    STRUCTURED_MAX_TEMPERATURE,
+    BrainClient,
+    BrainError,
+    ContextLengthError,
+    Sampling,
+    ToolCallCutOff,
+)
 from .config import settings
 from .contracts import InputFetchError
 from .envelope import (
@@ -42,6 +50,7 @@ from .envelope import (
 )
 from .filerefs import extract_from_messages
 from .prompts import CUT_OFF_CALL as _CUT_OFF_CALL
+from .prompts import CUT_OFF_TURN as _CUT_OFF_TURN
 from .prompts import NUDGE as _NUDGE
 from .prompts import OUT_OF_STEPS as _OUT_OF_STEPS
 from .prompts import SYSTEM_PROMPT
@@ -163,13 +172,29 @@ async def _run_tool_loop(
     # last round's OCR and detection, and one receipt was detected seven times over.
     answered = _answered_calls(messages)
     repeats = 0
+    cut_offs = 0
 
     for step in range(ctx.settings.max_tool_steps):
         # Text streams live unless this turn may yet be discarded for the nudge below.
         live = on_text if (not ctx.refs.refs or used or ran or nudged) else None
         held = _Narration(live) if live else None
-        reply = await brain.select_tools(messages, schemas, sampling, tool_choice=choice,
-                                         on_text=held.feed if held else None)
+        _report(ctx.progress, "model", step=step + 1, after_tools=bool(used or ran))
+        try:
+            reply = await brain.select_tools(messages, schemas, sampling, tool_choice=choice,
+                                             on_text=held.feed if held else None)
+        except ToolCallCutOff:
+            # The model wrote a call too long to finish -- a whole document copied into
+            # `text` -- and llama-server failed the response rather than return it cut off.
+            # Told so, it can call again by file reference; told twice, it will not.
+            cut_offs += 1
+            log.info("step %d: tool call cut off at the output token limit", step)
+            _report(ctx.progress, "cut_off")
+            if cut_offs >= 2:
+                return ([*messages, {"role": "user", "content": _OUT_OF_STEPS}],
+                        precontext, used, "", "stop")
+            messages = [*messages, {"role": "user", "content": _CUT_OFF_TURN}]
+            choice = "auto"
+            continue
         if held:
             held.end(called_tools=bool(reply.tool_calls))
         choice = "auto"
@@ -206,7 +231,7 @@ async def _run_tool_loop(
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [c.as_dict() for c in reply.tool_calls],
+                "tool_calls": [_replayable(c) for c in reply.tool_calls],
             }
         )
 
@@ -238,7 +263,7 @@ async def _run_tool_loop(
             # figures in it -- and they do not depend on each other, so running them one
             # after another just adds their latencies together.
             fresh = await asyncio.gather(*(
-                toolkit.dispatch(call.name, call.arguments, ctx)
+                _dispatch_reported(call, ctx)
                 for call, again in zip(reply.tool_calls, repeat, strict=True) if not again
             ))
             ran_now = iter(fresh)
@@ -273,6 +298,69 @@ async def _run_tool_loop(
             return messages, precontext, used, "", "stop"
 
     return [*messages, {"role": "user", "content": _OUT_OF_STEPS}], precontext, used, "", "stop"
+
+
+def _replayable(call) -> dict:
+    """A tool call as it goes back to the model in the next turn's history.
+
+    Arguments that are not JSON -- a call cut off at the token limit, mid-string -- go back
+    as `{}`. llama-server parses the history's calls and refused the whole next turn over
+    one: a request to translate a long PDF failed with "Failed to parse tool call
+    arguments" after the model had copied 20,000 characters into `text`. The call's
+    result says what went wrong, so nothing the model needs is lost.
+    """
+    out = call.as_dict()
+    try:
+        json.loads(call.arguments)
+    except (TypeError, ValueError):
+        out = {**out, "function": {**out["function"], "arguments": "{}"}}
+    return out
+
+
+def _report(sink: Callable[[dict], None] | None, stage: str, **fields: Any) -> None:
+    """One progress event, for a caller watching this request. Nothing when none is."""
+    if sink is not None:
+        sink({"stage": stage, **fields})
+
+
+async def _dispatch_reported(call, ctx: toolkit.ToolContext) -> toolkit.ToolResult:
+    """A tool call, reported as it starts and as it finishes."""
+    _report(ctx.progress, "tool_start", id=call.id, tool=call.name, detail=_call_detail(call, ctx))
+    started = time.monotonic()
+    result = await toolkit.dispatch(call.name, call.arguments, ctx)
+    _report(ctx.progress, "tool_end", id=call.id, tool=call.name,
+            ms=round((time.monotonic() - started) * 1000),
+            ok="error" not in result.model_facing)
+    return result
+
+
+def _call_detail(call, ctx: toolkit.ToolContext) -> str:
+    """What a tool call is working on, in a few words: the file's name, what it looks for."""
+    try:
+        args = json.loads(call.arguments) if isinstance(call.arguments, str) else (call.arguments or {})
+    except ValueError:
+        return ""
+    if not isinstance(args, dict):
+        return ""
+    parts: list[str] = []
+    target = args.get("file_ref_id") or args.get("url")
+    if isinstance(target, str) and target:
+        ref = ctx.refs.refs.get(target)
+        # An upload without a name of its own is called after its temp file; not that.
+        if ref and ref.filename and ref.filename != Path(ref.url).name:
+            parts.append(ref.filename)
+        elif ref and ref.mime.split("/")[0] in ("image", "audio", "video"):
+            # An image part carries no name; its kind is what can be said of it.
+            parts.append(ref.mime.split("/")[0])
+        elif target.startswith(("http://", "https://")):
+            parts.append(target.rsplit("/", 1)[-1].split("?", 1)[0] or target)
+    prompts = args.get("prompts")
+    if isinstance(prompts, list) and prompts:
+        parts.append(", ".join(str(p) for p in prompts[:6]) + ("…" if len(prompts) > 6 else ""))
+    if isinstance(args.get("target_language"), str):
+        parts.append(f"to {args['target_language']}")
+    detail = " · ".join(parts)
+    return detail if len(detail) <= 120 else detail[:119] + "…"
 
 
 _IMAGE_MENTION = re.compile(r"^\[image (ref-\d+)\]$|^\[file (ref-\d+): .*\]$")
@@ -498,8 +586,140 @@ def _as_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
+# A caller that sends this header with `stream: true` is told how its request is going
+# while it runs: each model turn, each tool as it starts and finishes, the guard, the
+# schema fill. The events ride as SSE comment lines (`: progress {...}`), which the SSE
+# spec and the OpenAI SDKs skip, so a client that does not read them sees the same
+# stream as before -- and a caller that does not send the header gets no comments at all.
+PROGRESS_HEADER = "x-interfaze-progress"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    if request.headers.get(PROGRESS_HEADER) != "true" or not await _asks_to_stream(request):
+        return await _chat_completions(request)
+
+    events: asyncio.Queue = asyncio.Queue()
+    answer = asyncio.create_task(
+        _chat_completions(request, lambda event: events.put_nowait(("progress", event))))
+    answer.add_done_callback(lambda _: events.put_nowait(("answered", None)))
+    # Committing to a stream sends a 200 status line. A request refused before any work
+    # began -- bad JSON, a bad key, an invalid schema -- reports nothing first, and is
+    # answered with its own status as without the header.
+    first = await events.get()
+    if first[0] == "answered":
+        return answer.result()
+    return StreamingResponse(
+        _with_progress(answer, events, first[1],
+                       show_precontext=request.headers.get("x-show-additional-info") == "true"),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _asks_to_stream(request: Request) -> bool:
+    try:
+        body = await request.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and bool(body.get("stream"))
+
+
+def _progress_comment(event: dict) -> str:
+    return f": progress {json.dumps(event, separators=(',', ':'), ensure_ascii=False, default=str)}\n\n"
+
+
+async def _with_progress(answer: asyncio.Task, events: asyncio.Queue, first: dict, *,
+                         show_precontext: bool) -> AsyncIterator[str]:
+    """The answer's own stream, with progress comments sent while it is worked out.
+
+    The answer is computed as it always is; whatever response it comes back as is then
+    relayed here. A streamed one is pumped through the same queue the progress arrives
+    on, so a tool's progress during a streamed answer reaches the caller in order.
+    """
+    pump: asyncio.Task | None = None
+
+    async def relay(body: AsyncIterator) -> None:
+        try:
+            async for chunk in body:
+                events.put_nowait(("chunk", chunk if isinstance(chunk, str) else chunk.decode()))
+        finally:
+            events.put_nowait(("end", None))
+
+    try:
+        yield _progress_comment(first)
+        while True:
+            kind, value = await events.get()
+            if kind == "progress":
+                yield _progress_comment(value)
+            elif kind == "chunk":
+                yield value
+            elif kind == "end":
+                return
+            elif kind == "answered":
+                try:
+                    response = answer.result()
+                except Exception:
+                    log.exception("request failed")
+                    yield sse(_error(_SOMETHING_WENT_WRONG, "internal_error", new_request_id()))
+                    yield sse("[DONE]")
+                    return
+                if isinstance(response, StreamingResponse):
+                    pump = asyncio.create_task(relay(response.body_iterator))
+                    continue
+                for chunk in _json_as_stream(response, show_precontext):
+                    yield chunk
+                return
+    finally:
+        # The caller went away: stop the work. Cancelling the relay closes the answer's
+        # own stream, whose cleanup deletes the request's uploads.
+        if not answer.done():
+            answer.cancel()
+        if pump is not None and not pump.done():
+            pump.cancel()
+
+
+def _json_as_stream(response: Response, show_precontext: bool) -> list[str]:
+    """A JSON answer, as the stream the caller asked for.
+
+    Most streamed requests are answered with a stream, but a few paths answer in JSON
+    -- an error found after work began, a reply reused from the tool turn -- and once
+    progress has been sent the status line is spent, so those go in-band.
+    """
+    try:
+        body = json.loads(response.body)
+    except ValueError:
+        body = {}
+    if response.status_code >= 400 or "error" in body:
+        return [sse(body if "error" in body else _error(_SOMETHING_WENT_WRONG, "internal_error",
+                                                        new_request_id())),
+                sse("[DONE]")]
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    base = {"id": body.get("id"), "object": "chat.completion.chunk",
+            "created": body.get("created"), "model": body.get("model")}
+
+    def chunk(delta: dict, finish: str | None = None, **extra) -> str:
+        return sse({**base, **extra,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+    out = [chunk({"role": "assistant", "content": ""})]
+    if show_precontext and body.get("precontext"):
+        from .envelope import PRECONTEXT_CLOSE, PRECONTEXT_OPEN
+        blob = json.dumps(body["precontext"], separators=(",", ":"), ensure_ascii=False)
+        out.append(chunk({"content": f"{PRECONTEXT_OPEN} {blob} {PRECONTEXT_CLOSE}"}))
+    if message.get("content"):
+        out.append(chunk({"content": message["content"]}))
+    if message.get("tool_calls"):
+        out.append(chunk({"tool_calls": [{**c, "index": i}
+                                          for i, c in enumerate(message["tool_calls"])]}))
+    out.append(chunk({}, choice.get("finish_reason") or "stop", usage=body.get("usage")))
+    out.append(sse("[DONE]"))
+    return out
+
+
+async def _chat_completions(request: Request,
+                            progress: Callable[[dict], None] | None = None):
     request_id = new_request_id()
     try:
         body = await request.json()
@@ -568,6 +788,7 @@ async def chat_completions(request: Request):
     # this worker. It runs on every request that carries a file.
     refs, messages = await asyncio.to_thread(extract_from_messages, raw_messages)
     manifest = refs.manifest()
+    _report(progress, "received", files=len(refs.refs))
 
     # One system message, always. the brain's chat template rejects a second one with
     # "System message must be at the beginning", so the file manifest is appended to
@@ -616,7 +837,8 @@ async def chat_completions(request: Request):
     ctx = toolkit.ToolContext(refs=refs, http=app.state.http, settings=settings,
                               ground=brain.ground, structured=brain.structured, usage=usage,
                               wants_geometry=_schema_wants_geometry(schema),
-                              zdr=request.headers.get("x-interfaze-zdr") == "true")
+                              zdr=request.headers.get("x-interfaze-zdr") == "true",
+                              progress=progress)
 
     # Translation and forecasting are offered when the request's instruction asks for
     # them, or when it is routed to one of them. Offered on every request, they were
@@ -632,6 +854,7 @@ async def chat_completions(request: Request):
     # the verdict and never reaches a tool or the model.
     guard_items: list[PrecontextItem] = []
     if guard_codes is not None:
+        _report(progress, "guard", codes=guard_codes)
         try:
             safe, verdict_text, guard_items = await _run_guard(guard_codes, messages, refs, brain, usage)
         except InputFetchError:
@@ -751,6 +974,7 @@ async def chat_completions(request: Request):
             system = "\n\n".join(p for p in (SCHEMA_PROMPT, caller_system) if p)
             body = convo[1:] if ctx.wants_geometry else _without_page_geometry(convo[1:])
             shaped = [{"role": "system", "content": system}, *body]
+            _report(progress, "structuring")
             reply = await brain.structured(shaped, schema, sampling)
             usage.prompt_tokens += reply.prompt_tokens
             usage.completion_tokens += reply.completion_tokens
@@ -759,6 +983,7 @@ async def chat_completions(request: Request):
                 # Guided decoding still lost its place once in ten on a dense schema -- a key
                 # with no colon after it. One more draw; kept only if it parses.
                 log.warning("structured reply did not parse; drawing again")
+                _report(progress, "structuring", retry=True)
                 again = await brain.structured(
                     shaped, schema, replace(sampling, temperature=STRUCTURED_MAX_TEMPERATURE))
                 usage.prompt_tokens += again.prompt_tokens
@@ -792,6 +1017,7 @@ async def chat_completions(request: Request):
 
         if want_stream:
             streaming_owns_refs = True
+            _report(progress, "reasoning" if think else "writing")
             return StreamingResponse(
                 _stream_response(brain, convo, completion, refs, think, effort,
                                  sampling, show_debug),
@@ -955,6 +1181,7 @@ async def _stream_turns(brain: BrainClient, convo: list[dict], ctx, completion: 
                     # what the tools returned, as the buffered path does, rather than
                     # close the stream empty.
                     outcome = {"finish_reason": "stop"}
+                    _report(ctx.progress, "writing")
                     async for piece in brain.synthesise_stream(
                             value[0], sampling=sampling,
                             on_finish=lambda reason: outcome.update(finish_reason=reason),

@@ -8,6 +8,7 @@ SSE framing -- against fixtures instead of a GPU.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import types
 
@@ -2526,3 +2527,167 @@ def test_a_structured_reply_that_does_not_parse_is_drawn_again(client_for, monke
         "messages": [{"role": "user", "content": "hi"}], "response_format": schema}).json()
     assert json.loads(body["choices"][0]["message"]["content"]) == {"title": "Interfaze"}
     assert len([p for p in fake.tool_payloads if p.get("response_format")]) == 2
+
+
+def _progress_stream(client, body, headers=None):
+    with client.stream("POST", "/v1/chat/completions", json=body,
+                       headers={"x-interfaze-progress": "true", **(headers or {})}) as resp:
+        raw = "".join(resp.iter_text())
+    events = [json.loads(line[len(": progress "):])
+              for line in raw.splitlines() if line.startswith(": progress ")]
+    chunks = [json.loads(line[6:]) for line in raw.splitlines()
+              if line.startswith("data: ") and line[6:].strip() != "[DONE]"]
+    return resp, raw, events, chunks
+
+
+def test_a_watched_request_reports_each_tool_as_it_runs(client_for):
+    fake = Fake([
+        brain_body(tool_calls=[{"id": "c1", "type": "function", "function": {
+            "name": "ocr", "arguments": json.dumps({"file_ref_id": "ref-0"})}}]),
+        brain_body("The invoice total is 42.00."),
+    ])
+    client = client_for(fake)
+    resp, raw, events, chunks = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is the total?"},
+            {"type": "file", "file": {"file_data": "data:image/png;base64,"
+                                      + base64.b64encode(_PNG_800x600).decode(),
+                                      "filename": "invoice.png"}},
+        ]}]})
+
+    assert resp.status_code == 200
+    stages = [e["stage"] for e in events]
+    assert stages[0] == "received" and events[0]["files"] == 1
+    assert stages.index("model") < stages.index("tool_start") < stages.index("tool_end")
+    start = next(e for e in events if e["stage"] == "tool_start")
+    end = next(e for e in events if e["stage"] == "tool_end")
+    assert start["tool"] == "ocr" and start["detail"] == "invoice.png" and start["id"] == "c1"
+    assert end["ok"] is True and end["ms"] >= 0
+    # The answer is the same stream it always was, around the comments.
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    assert text == "The invoice total is 42.00."
+    assert raw.rstrip().endswith("data: [DONE]")
+
+
+def test_progress_is_only_sent_to_a_caller_that_asks(client_for):
+    fake = Fake([brain_body("hi")])
+    client = client_for(fake)
+    with client.stream("POST", "/v1/chat/completions", json={
+            "stream": True, "messages": [{"role": "user", "content": "hello"}]}) as resp:
+        raw = "".join(resp.iter_text())
+    assert ": progress" not in raw
+
+
+def test_a_watched_request_refused_up_front_keeps_its_status(client_for):
+    client = client_for(Fake([]))
+    resp = client.post("/v1/chat/completions", headers={"x-interfaze-progress": "true"},
+                       json={"stream": True, "messages": "not a list"})
+    assert resp.status_code == 400
+    assert "error" in resp.json()
+
+
+def test_a_watched_structured_answer_reports_the_schema_fill(client_for):
+    fake = Fake([brain_body()])
+    client = client_for(fake)
+    resp, _, events, chunks = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": "give me a"}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "r", "schema": {"type": "object", "properties": {"a": {"type": "number"}}}}}})
+    assert resp.status_code == 200
+    assert "structuring" in [e["stage"] for e in events]
+    assert "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks) == '{"a":1}'
+
+
+def test_a_json_answer_after_progress_goes_in_band():
+    from fastapi.responses import JSONResponse
+    failed = app_module._json_as_stream(
+        JSONResponse(status_code=502, content={"error": {"message": "boom"}}), False)
+    assert json.loads(failed[0][6:]) == {"error": {"message": "boom"}}
+    assert failed[-1] == "data: [DONE]\n\n"
+
+    done = app_module._json_as_stream(JSONResponse({
+        "id": "req-1", "created": 1, "model": "m", "usage": {"total_tokens": 3},
+        "precontext": [{"name": "ocr", "result": {}}],
+        "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+    }), True)
+    deltas = [json.loads(c[6:])["choices"][0] for c in done[:-1]]
+    assert deltas[1]["delta"]["content"].startswith("<precontext> ")
+    assert deltas[2]["delta"]["content"] == "hi"
+    assert deltas[-1]["finish_reason"] == "stop"
+
+
+_CUT_OFF_500 = {"error": {"code": 500, "message": (
+    "Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error "
+    "at line 1, column 20181: syntax error while parsing value - invalid string: missing "
+    "closing quote")}}
+
+
+def test_a_tool_call_cut_off_by_llama_server_is_retried_not_failed(client_for):
+    """llama-server fails a response whose tool call ran past the token limit, rather than
+    returning it cut off as vLLM does. The model is told and asked again."""
+    from interfaze_lite.prompts import CUT_OFF_TURN
+
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), brain_body("Translated it in parts.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["message"]["content"] == "Translated it in parts."
+    retry = fake.tool_payloads[-1]["messages"]
+    assert retry[-1] == {"role": "user", "content": CUT_OFF_TURN}
+
+
+def test_a_second_cut_off_answers_instead_of_trying_again(client_for):
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), httpx.Response(500, json=_CUT_OFF_500),
+                 brain_body("That document is too long to copy into a tool call.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    assert "too long" in resp.json()["choices"][0]["message"]["content"]
+    assert len(fake.tool_payloads) == 3
+
+
+def test_a_watched_cut_off_is_reported(client_for):
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), brain_body("Done.")])
+    client = client_for(fake)
+    # Buffered (a schema) so the scripted 500 is served on the non-streamed path.
+    _, _, events, _ = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": "translate this into English"}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "r", "schema": {"type": "object", "properties": {"a": {"type": "number"}}}}}})
+    stages = [e["stage"] for e in events]
+    assert stages.count("model") == 2 and stages.index("cut_off") == stages.index("model") + 1
+
+
+def test_brain_failures_are_classified():
+    from interfaze_lite.brain import BrainError, ContextLengthError, ToolCallCutOff, _failure
+
+    assert isinstance(_failure(500, json.dumps(_CUT_OFF_500)), ToolCallCutOff)
+    assert isinstance(_failure(400, '{"error":{"message":"exceeds the available context size"}}'),
+                      ContextLengthError)
+    other = _failure(503, "busy")
+    assert type(other) is BrainError and "503" in str(other)
+
+
+def test_a_cut_off_call_goes_back_to_the_model_as_valid_json(client_for):
+    """A call cut off mid-string is answered as cut off, and replayed with `{}` arguments:
+    llama-server refused the next turn outright over the unparseable ones."""
+    from interfaze_lite.prompts import CUT_OFF_CALL
+
+    cut = brain_body(tool_calls=[{"id": "c1", "type": "function", "function": {
+        "name": "translate", "arguments": '{"text":"海図（かいず、英語：nautical chart）は、水路'}}])
+    cut["choices"][0]["finish_reason"] = "length"
+    fake = Fake([cut, brain_body("I translated it from the file instead.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    history = fake.tool_payloads[-1]["messages"]
+    call = next(m for m in history if m.get("tool_calls"))["tool_calls"][0]
+    assert call["function"] == {"name": "translate", "arguments": "{}"}
+    result = next(m for m in history if m.get("role") == "tool")
+    assert CUT_OFF_CALL in result["content"]

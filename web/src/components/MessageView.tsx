@@ -3,7 +3,9 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { formatBytes } from "../attachments";
 import type { AssistantMessage, UserMessage } from "../types";
-import { ToolResult } from "./ToolResult";
+import { Progress } from "./Progress";
+import { Reasoning } from "./Reasoning";
+import { hasRichView, ToolResult } from "./ToolResult";
 
 export function UserView({ message }: { message: UserMessage }) {
   return (
@@ -56,7 +58,7 @@ function Stats({ message }: { message: AssistantMessage }) {
     const r = u.completion_tokens_details?.reasoning_tokens;
     if (r) parts.push(`${r.toLocaleString()} reasoning`);
   }
-  if (message.finishReason && message.finishReason !== "stop") parts.push(`finish: ${message.finishReason}`);
+  if (message.finishReason && !["stop", "length"].includes(message.finishReason)) parts.push(`finish: ${message.finishReason}`);
   if (message.status === "stopped") parts.push("stopped");
   return parts.length ? <div className="stats">{parts.join(" · ")}</div> : null;
 }
@@ -74,30 +76,33 @@ export function AssistantView({ message, image }: { message: AssistantMessage; i
     const same = JSON.stringify(routed.result);
     return message.precontext.filter((p) => JSON.stringify(p.result) !== same);
   }, [message.precontext, routed]);
-  const [open, setOpen] = useState(true);
-  const waiting = message.status === "streaming" && !message.text;
+  // Open when there is something to look at; a result that is only JSON (a PDF's OCR)
+  // starts folded, so it does not push the answer out of view.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const rich = useMemo(() => tools.some((t) => hasRichView(t.result, image)), [tools, image]);
+  const open = toggled ?? rich;
+  const live = message.status === "streaming";
 
   return (
     <div className="msg assistant">
+      <Progress
+        steps={message.steps}
+        live={live}
+        folded={!!message.text}
+        startedAt={message.startedAt}
+        finishedAt={message.finishedAt}
+        waitingLabel={message.steps.length ? "Working…" : "Sending the request…"}
+      />
+      {message.reasoning && <Reasoning text={message.reasoning} live={live && !!message.thinking} />}
       {tools.length > 0 && (
         <div className="tools">
-          <button className="ghost small" onClick={() => setOpen((o) => !o)}>
+          <button className="ghost small" onClick={() => setToggled(!open)}>
             {open ? "▾" : "▸"} {tools.length} tool result{tools.length > 1 ? "s" : ""}
           </button>
           {open &&
             tools.map((item, i) => (
               <ToolResult key={i} name={item.name} result={item.result} image={image} />
             ))}
-        </div>
-      )}
-      {waiting && (
-        <div className="thinking">
-          <span className="dot" />
-          <span className="dot" />
-          <span className="dot" />
-          <span className="muted">
-            {message.precontext.length ? "Writing the answer…" : "Reading the request and running tools…"}
-          </span>
         </div>
       )}
       {routed ? (
@@ -110,6 +115,12 @@ export function AssistantView({ message, image }: { message: AssistantMessage; i
             <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
           </div>
         )
+      )}
+      {message.status === "done" && message.finishReason === "length" && (
+        <div className="notice">
+          The answer reached the model's output limit and was cut off.
+          {tools.some((t) => hasRichView(t.result, image)) && " The complete result is in the tool card above."}
+        </div>
       )}
       {message.error && <div className="error">{message.error}</div>}
       <Stats message={message} />

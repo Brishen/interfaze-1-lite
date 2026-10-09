@@ -42,14 +42,41 @@ async def _translate_chunk(chunk: str, target: str, current: str | None,
     raise RuntimeError(f"translation did not return a translated_text: {last}")
 
 
+async def _document_text(ref: str, ctx: ToolContext) -> tuple[str | None, ToolResult | None]:
+    """An attached file's text, read by the OCR tool: (text, None), or (None, why not).
+
+    The OCR tool keeps its reading for the rest of the request, so a document the model
+    has already read is not read again.
+    """
+    from .ocr import OCR
+
+    read = await OCR.execute({"file_ref_id": ref}, ctx)
+    if "error" in read.model_facing:
+        return None, read
+    text = (read.full or {}).get("extracted_text") or read.model_facing.get("extracted_text") or ""
+    if not text.strip():
+        return None, ToolResult(model_facing={"error": "No text was found in this file",
+                                              "message": "There is nothing in it to translate."})
+    return text, None
+
+
 async def _run_translate(args: dict, ctx: ToolContext) -> ToolResult:
     text = args.get("text")
     target = str(args.get("target_language") or "").strip()
     current = str(args.get("current_language") or "").strip() or None
 
+    # A document is translated from the file. Copied into `text` by the model, a long one
+    # ran past the output token limit mid-string and the call never completed.
+    ref = args.get("file_ref_id")
+    if ref and not text:
+        text, failed = await _document_text(str(ref), ctx)
+        if failed is not None:
+            return failed
+
     if not text or (isinstance(text, list) and not all(isinstance(t, str) and t for t in text)):
         return ToolResult(model_facing={"error": "Text is required",
-                                        "message": "Pass the text to translate as a string or a list of strings."})
+                                        "message": ("Pass the text to translate as a string or a list of "
+                                                    "strings, or an attached file by file_ref_id.")})
     if current and current == target:
         # interfaze's own validation rule. It is also what stops the model "translating"
         # a passage into the language it is already in.
@@ -108,7 +135,9 @@ TRANSLATE = Tool(
         "— long inputs are automatically split and batched internally, so you do not need "
         "to chunk. Use only when the user asks for text to be translated into another "
         "language; never to read, answer or reason about text that is merely written in "
-        "another language."
+        "another language. To translate an attached document or image, pass its file_ref_id "
+        "instead of text: the tool reads the file itself, so never copy a document's text "
+        "into the call."
     ),
     parameters={
         "type": "object",
@@ -121,6 +150,12 @@ TRANSLATE = Tool(
                 "description": ("The text to translate. Pass a single string of any length, or an "
                                 "array of strings for batch translation. Long text is split and "
                                 "batched internally — pass the full text as-is."),
+            },
+            "file_ref_id": {
+                "type": "string",
+                "description": ("An attached document or image to translate, by its file "
+                                "reference id. Use this rather than text for anything "
+                                "attached; leave text out when it is set."),
             },
             "target_language": {
                 "type": "string",
@@ -135,7 +170,7 @@ TRANSLATE = Tool(
                                 "target_language there is nothing to translate."),
             },
         },
-        "required": ["text", "target_language", "current_language"],
+        "required": ["target_language", "current_language"],
         "additionalProperties": False,
     },
     execute=_run_translate,

@@ -419,31 +419,168 @@ textarea:focus {
   animation: blink 1s steps(1) infinite;
 }
 
-.thinking {
+.progress {
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step {
   display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 14px;
+  gap: 8px;
+  min-width: 0;
 }
 
-.thinking .muted {
-  margin-left: 6px;
+.step-label {
+  white-space: nowrap;
 }
 
-.dot {
-  width: 6px;
-  height: 6px;
+.step.running .step-label {
+  font-weight: 550;
+}
+
+.step-detail {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.step-time {
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.step-icon {
+  width: 14px;
+  text-align: center;
+  font-size: 12px;
+  flex: none;
+}
+
+.step-icon.done {
+  color: var(--ok);
+}
+
+.step-icon.failed {
+  color: var(--bad);
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  margin: 0 1px;
   border-radius: 50%;
-  background: var(--muted);
-  animation: bounce 1.2s infinite;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+  flex: none;
+  display: inline-block;
 }
 
-.dot:nth-child(2) {
-  animation-delay: 0.15s;
+.bar {
+  flex: 1;
+  max-width: 200px;
+  min-width: 60px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
 }
 
-.dot:nth-child(3) {
-  animation-delay: 0.3s;
+.bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s;
+}
+
+.progress.done summary {
+  cursor: pointer;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  width: fit-content;
+}
+
+.progress.done summary::-webkit-details-marker {
+  display: none;
+}
+
+.progress.done summary::before {
+  content: "▸";
+  font-size: 11px;
+}
+
+.progress.done[open] summary::before {
+  content: "▾";
+}
+
+.progress.done[open] .steps {
+  margin-top: 8px;
+  padding-left: 18px;
+}
+
+.reasoning {
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.reasoning summary,
+.reasoning-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  width: fit-content;
+}
+
+.reasoning summary {
+  list-style: none;
+}
+
+.reasoning summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning summary::before {
+  content: "▸";
+  font-size: 11px;
+}
+
+.reasoning[open] summary::before {
+  content: "▾";
+}
+
+.reasoning-text {
+  white-space: pre-wrap;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 12px;
+  margin-top: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.reasoning.live .reasoning-text {
+  max-height: 160px;
 }
 
 .stats {
@@ -458,6 +595,15 @@ textarea:focus {
   border-radius: 8px;
   padding: 8px 12px;
   margin-top: 8px;
+}
+
+.notice {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 10px;
+  font-size: 14px;
 }
 
 .error.small {
@@ -552,6 +698,14 @@ textarea:focus {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.json pre.plain {
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.6;
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .json .copy {
@@ -775,16 +929,9 @@ textarea:focus {
   }
 }
 
-@keyframes bounce {
-  0%,
-  80%,
-  100% {
-    transform: translateY(0);
-    opacity: 0.5;
-  }
-  40% {
-    transform: translateY(-4px);
-    opacity: 1;
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 

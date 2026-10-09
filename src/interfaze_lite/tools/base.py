@@ -47,6 +47,10 @@ class ToolContext:
     # answering a layout question with no geometry; the schema is unambiguous, so
     # trust that instead of the model's judgement.
     wants_geometry: bool = False
+    # Where this request's progress goes -- a model turn starting, a tool starting or
+    # finishing -- for a caller that asked to watch it (`x-interfaze-progress`). None
+    # otherwise, and then nothing is reported.
+    progress: Callable[[dict], None] | None = None
 @dataclass
 class ToolResult:
     model_facing: dict[str, Any]

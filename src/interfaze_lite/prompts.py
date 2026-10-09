@@ -87,3 +87,10 @@ CUT_OFF_CALL = ("This call was cut off at the output token limit before its argu
                 "complete, so it was not run. Do not copy long data into tool arguments: "
                 "pass a file by file_ref_id, and leave out data that is written in the "
                 "user's message.")
+
+# The same, when the server could not return the cut-off call at all (llama-server fails
+# the response instead), so there is no call to answer and the note goes in a user turn.
+CUT_OFF_TURN = ("Your last tool call was cut off at the output token limit before its "
+                "arguments were complete, so it was not run. Do not copy long data into tool "
+                "arguments: pass a file by file_ref_id, and leave out data that is written in "
+                "the user's message.")

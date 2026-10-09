@@ -48,6 +48,10 @@ export function Composer({ busy, onSend, onStop }: Props) {
       recording.stop();
       return;
     }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("Recording needs HTTPS or localhost; attach an audio file instead.");
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const recorder = new MediaRecorder(stream);
