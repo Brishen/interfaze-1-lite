@@ -31,6 +31,7 @@ from . import forecasting
 from . import guard as guardrails
 from . import intent
 from . import tools as toolkit
+from . import translation
 from .brain import (
     STRUCTURED_MAX_TEMPERATURE,
     BrainClient,
@@ -54,6 +55,7 @@ from .prompts import CUT_OFF_TURN as _CUT_OFF_TURN
 from .prompts import NUDGE as _NUDGE
 from .prompts import OUT_OF_STEPS as _OUT_OF_STEPS
 from .prompts import SYSTEM_PROMPT
+from .prompts import TRANSLATION_SHOWN as _TRANSLATION_SHOWN
 from .validate import (
     RequestError,
     check_api_key,
@@ -271,6 +273,9 @@ async def _run_tool_loop(
 
         for call, key, again, result in zip(reply.tool_calls, keys, repeat, results, strict=True):
             content = _as_json(result.model_facing)
+            if (call.name == "translate" and ctx.shows_translations
+                    and "error" not in result.model_facing):
+                content = _as_json({**result.model_facing, "note": _TRANSLATION_SHOWN})
             if again:
                 content = _ALREADY_ANSWERED_NOTE + answered.get(key, "")
             else:
@@ -298,6 +303,31 @@ async def _run_tool_loop(
             return messages, precontext, used, "", "stop"
 
     return [*messages, {"role": "user", "content": _OUT_OF_STEPS}], precontext, used, "", "stop"
+
+
+def _shown_translations(precontext: list[PrecontextItem], said: str) -> str:
+    """The request's translations, to follow the model's reply in the answer.
+
+    The model was told its reply is followed by them (TRANSLATION_SHOWN), so it writes an
+    introduction, or what else was asked, instead of retyping them. One it retyped anyway
+    is not added a second time.
+    """
+    found = [p.result for p in precontext
+             if p.name == "translate" and isinstance(p.result, dict) and p.result.get("translated_text")]
+    blocks: list[str] = []
+    for result in found:
+        text = result["translated_text"]
+        text = "\n\n".join(text) if isinstance(text, list) else str(text)
+        if text.strip()[:80] in said:
+            continue
+        if len(found) > 1:
+            code = str(result.get("target_language") or "")
+            name = (translation.languages().get(code) or {}).get("name") or code
+            text = f"**{name}**\n\n{text}"
+        blocks.append(text.strip())
+    if not blocks:
+        return ""
+    return ("\n\n" if said.strip() else "") + "\n\n".join(blocks)
 
 
 def _replayable(call) -> dict:
@@ -838,7 +868,7 @@ async def _chat_completions(request: Request,
                               ground=brain.ground, structured=brain.structured, usage=usage,
                               wants_geometry=_schema_wants_geometry(schema),
                               zdr=request.headers.get("x-interfaze-zdr") == "true",
-                              progress=progress)
+                              progress=progress, shows_translations=not schema and not task)
 
     # Translation and forecasting are offered when the request's instruction asks for
     # them, or when it is routed to one of them. Offered on every request, they were
@@ -1012,6 +1042,12 @@ async def _chat_completions(request: Request,
         # duplicate to avoid. It is still skipped when the caller asked to reason: the
         # selection turn runs with thinking off, so reusing it would quietly drop the
         # reasoning that was asked for.
+        # A translation is the answer as the tool returned it, after whatever the model
+        # said: told so, it may say nothing, and that is not an answer to regenerate.
+        shown = _shown_translations(precontext, direct) if ctx.shows_translations else ""
+        if shown and not think:
+            return JSONResponse(completion.message(direct + shown, direct_reason))
+
         if settings.reuse_tool_turn_answer and direct.strip() and not think:
             return JSONResponse(completion.message(direct, direct_reason))
 
@@ -1020,7 +1056,7 @@ async def _chat_completions(request: Request,
             _report(progress, "reasoning" if think else "writing")
             return StreamingResponse(
                 _stream_response(brain, convo, completion, refs, think, effort,
-                                 sampling, show_debug),
+                                 sampling, show_debug, shows_translations=ctx.shows_translations),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -1031,8 +1067,10 @@ async def _chat_completions(request: Request,
         usage.completion_tokens += reply.completion_tokens
         usage.reasoning_tokens += reply.reasoning_tokens
         completion.reasoning = reply.reasoning or None
-        return JSONResponse(
-            completion.message(reply.content or direct, reply.finish_reason))
+        answer = reply.content or direct
+        if ctx.shows_translations:
+            answer += _shown_translations(precontext, answer)
+        return JSONResponse(completion.message(answer, reply.finish_reason))
 
     except ContextLengthError as exc:
         return JSONResponse(status_code=400, content=_error(str(exc), "invalid_request_error", request_id))
@@ -1151,6 +1189,7 @@ async def _stream_turns(brain: BrainClient, convo: list[dict], ctx, completion: 
     task = asyncio.create_task(run())
     shown = 0
     spoke = False
+    said: list[str] = []
 
     def unshown_precontext() -> list[str]:
         nonlocal shown
@@ -1167,6 +1206,7 @@ async def _stream_turns(brain: BrainClient, convo: list[dict], ctx, completion: 
             item = await queue.get()
             if isinstance(item, str):
                 spoke = True
+                said.append(item)
                 for chunk in unshown_precontext():
                     yield chunk
                 yield _content_chunk(completion, item)
@@ -1176,7 +1216,9 @@ async def _stream_turns(brain: BrainClient, convo: list[dict], ctx, completion: 
                 for chunk in unshown_precontext():
                     yield chunk
                 finish = value[4]
-                if not spoke:
+                # Told its reply is followed by the translation, the model may say nothing.
+                translated = ctx.shows_translations and _shown_translations(completion.precontext, "")
+                if not spoke and not translated:
                     # The last turn ended with neither text nor a tool call. Answer from
                     # what the tools returned, as the buffered path does, rather than
                     # close the stream empty.
@@ -1186,8 +1228,12 @@ async def _stream_turns(brain: BrainClient, convo: list[dict], ctx, completion: 
                             value[0], sampling=sampling,
                             on_finish=lambda reason: outcome.update(finish_reason=reason),
                             on_usage=lambda counts: _add_usage(completion, counts)):
+                        said.append(piece)
                         yield _content_chunk(completion, piece)
                     finish = outcome["finish_reason"]
+                if ctx.shows_translations and (shown_text := _shown_translations(
+                        completion.precontext, "".join(said))):
+                    yield _content_chunk(completion, shown_text)
                 yield sse(_final_chunk(completion, finish))
             elif kind == "calls":
                 for chunk in unshown_precontext():
@@ -1246,6 +1292,7 @@ async def _stream_response(
     brain: BrainClient, convo: list[dict], completion: Completion, refs,
     think: bool = False, effort: str | None = None,
     sampling: Sampling | None = None, show_precontext: bool = False,
+    shows_translations: bool = False,
 ) -> AsyncIterator[str]:
     """SSE: role chunk, precontext chunk, content deltas, finish, [DONE]."""
     try:
@@ -1259,10 +1306,14 @@ async def _stream_response(
         def note_finish(reason: str) -> None:
             outcome["finish_reason"] = reason
 
+        said: list[str] = []
         async for piece in brain.synthesise_stream(
                 convo, think=think, effort=effort, sampling=sampling,
                 on_finish=note_finish, on_usage=lambda counts: _add_usage(completion, counts)):
+            said.append(piece)
             yield _content_chunk(completion, piece)
+        if shows_translations and (shown := _shown_translations(completion.precontext, "".join(said))):
+            yield _content_chunk(completion, shown)
 
         yield sse(_final_chunk(completion, outcome["finish_reason"]))
         yield sse("[DONE]")
