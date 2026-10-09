@@ -9,6 +9,14 @@
 # gated). On a host with a llama.cpp build of its own, llamacpp/run.sh runs the same
 # stack without this image.
 
+# The web UI, built on its own so Node never enters the runtime image.
+FROM node:22-slim AS web
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM ghcr.io/ggml-org/llama.cpp:server-cuda
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -30,6 +38,7 @@ ENV UV_PYTHON=3.12 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --extra llamacpp --no-install-project
 COPY src ./src
+COPY --from=web /build/src/interfaze_lite/web ./src/interfaze_lite/web
 COPY components.env.example ./
 COPY llamacpp ./llamacpp
 RUN uv sync --frozen --extra llamacpp && chmod +x llamacpp/run.sh

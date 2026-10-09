@@ -17,12 +17,14 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import forecasting
 from . import guard as guardrails
@@ -1122,3 +1124,11 @@ def _stream_failure(completion: Completion) -> str:
     """
     return sse(_error("The response failed while streaming. Please try again.",
                       "server_error", completion.request_id))
+
+
+# The web UI, when it has been built. Mounted after every route, so the API keeps its paths
+# and the UI takes the rest. It holds no data of its own: the API key, when one is set,
+# is still required on each request the page makes.
+_web_dir = Path(settings.web_dir) if settings.web_dir else Path(__file__).parent / "web"
+if settings.web_ui and (_web_dir / "index.html").is_file():
+    app.mount("/", StaticFiles(directory=_web_dir, html=True), name="web")

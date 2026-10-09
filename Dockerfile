@@ -10,6 +10,14 @@
 # HF_TOKEN is required: the diarization model is gated on Hugging Face, and an
 # anonymous download returns 401. Accept their terms on huggingface.co first.
 
+# The web UI, built on its own so Node never enters the runtime image.
+FROM node:22-slim AS web
+WORKDIR /build/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -47,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3.12-dev 
 
 WORKDIR /app
 COPY src/interfaze_lite /app/interfaze_lite
+COPY --from=web /build/src/interfaze_lite/web /app/interfaze_lite/web
 COPY components.env.example /app/components.env.default
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

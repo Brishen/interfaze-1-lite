@@ -79,6 +79,18 @@ if [[ ! -x "${ROOT}/.venv/bin/uvicorn" ]]; then
 fi
 PY_BIN="${ROOT}/.venv/bin"
 
+# The web UI is served from the package once built. Build it here when Node is at hand;
+# without it the API runs as before and the UI is simply absent.
+if [[ ! -f "${ROOT}/src/interfaze_lite/web/index.html" && -f "${ROOT}/web/package.json" ]]; then
+    if command -v npm >/dev/null; then
+        echo "building the web UI"
+        (cd "${ROOT}/web" && npm ci --no-audit --no-fund && npm run build) >"${LOG_DIR}/web-build.log" 2>&1 \
+            || echo "      web UI build failed (see ${LOG_DIR}/web-build.log); serving the API only"
+    else
+        echo "      npm not found: serving the API without the web UI"
+    fi
+fi
+
 # Component mapping for the sidecars, as the container reads it: a COMPONENT_* you pass
 # wins, then components.env, then components.env.example.
 load_components() {
@@ -202,6 +214,7 @@ echo "[5/5] interfaze-1-lite on :${PORT}"
     >"${LOG_DIR}/orchestrator.log" 2>&1 &
 PIDS+=($!); wait_for "orchestrator" "http://127.0.0.1:${PORT}/health" "$!" 300 "${LOG_DIR}/orchestrator.log"
 echo "ready: POST http://localhost:${PORT}/v1/chat/completions (logs in ${LOG_DIR})"
+[[ -f "${ROOT}/src/interfaze_lite/web/index.html" ]] && echo "       web UI: http://localhost:${PORT}/"
 
 # One process dying takes the rest down, rather than serving with a piece missing.
 set +e

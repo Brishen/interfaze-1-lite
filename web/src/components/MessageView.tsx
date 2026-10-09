@@ -1,0 +1,105 @@
+import { useMemo, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { formatBytes } from "../attachments";
+import type { AssistantMessage, UserMessage } from "../types";
+import { ToolResult } from "./ToolResult";
+
+export function UserView({ message }: { message: UserMessage }) {
+  return (
+    <div className="msg user">
+      <div className="bubble">
+        {message.attachments.length > 0 && (
+          <div className="attachments">
+            {message.attachments.map((a) =>
+              a.kind === "image" ? (
+                <img key={a.id} className="thumb" src={a.dataUri} alt={a.name} title={a.name} />
+              ) : a.kind === "audio" ? (
+                <div key={a.id} className="file-chip audio">
+                  <span>{a.name}</span>
+                  <audio controls src={a.dataUri} />
+                </div>
+              ) : (
+                <div key={a.id} className="file-chip">
+                  <span className="file-icon">{a.name.split(".").pop()?.toUpperCase().slice(0, 4)}</span>
+                  <span>{a.name}</span>
+                  <span className="muted">{formatBytes(a.size)}</span>
+                </div>
+              ),
+            )}
+          </div>
+        )}
+        {message.text && <div className="user-text">{message.text}</div>}
+      </div>
+    </div>
+  );
+}
+
+/** JSON answers (a run task, or a schema) are shown as data, not as prose. */
+function parseJson(text: string): unknown | undefined {
+  const t = text.trim();
+  if (!t.startsWith("{") && !t.startsWith("[")) return undefined;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return undefined;
+  }
+}
+
+function Stats({ message }: { message: AssistantMessage }) {
+  const parts: string[] = [];
+  if (message.finishedAt) parts.push(`${((message.finishedAt - message.startedAt) / 1000).toFixed(1)} s`);
+  if (message.firstTokenAt) parts.push(`first text ${((message.firstTokenAt - message.startedAt) / 1000).toFixed(1)} s`);
+  const u = message.usage;
+  if (u) {
+    parts.push(`${u.prompt_tokens.toLocaleString()} in · ${u.completion_tokens.toLocaleString()} out`);
+    const r = u.completion_tokens_details?.reasoning_tokens;
+    if (r) parts.push(`${r.toLocaleString()} reasoning`);
+  }
+  if (message.finishReason && message.finishReason !== "stop") parts.push(`finish: ${message.finishReason}`);
+  if (message.status === "stopped") parts.push("stopped");
+  return parts.length ? <div className="stats">{parts.join(" · ")}</div> : null;
+}
+
+export function AssistantView({ message, image }: { message: AssistantMessage; image?: string }) {
+  const json = useMemo(() => (message.status === "done" ? parseJson(message.text) : undefined), [message.status, message.text]);
+  const [open, setOpen] = useState(true);
+  const waiting = message.status === "streaming" && !message.text;
+
+  return (
+    <div className="msg assistant">
+      {message.precontext.length > 0 && (
+        <div className="tools">
+          <button className="ghost small" onClick={() => setOpen((o) => !o)}>
+            {open ? "▾" : "▸"} {message.precontext.length} tool result{message.precontext.length > 1 ? "s" : ""}
+          </button>
+          {open &&
+            message.precontext.map((item, i) => (
+              <ToolResult key={i} name={item.name} result={item.result} image={image} />
+            ))}
+        </div>
+      )}
+      {waiting && (
+        <div className="thinking">
+          <span className="dot" />
+          <span className="dot" />
+          <span className="dot" />
+          <span className="muted">
+            {message.precontext.length ? "Writing the answer…" : "Reading the request and running tools…"}
+          </span>
+        </div>
+      )}
+      {json !== undefined ? (
+        <ToolResult name="answer" result={json} image={image} />
+      ) : (
+        message.text && (
+          <div className={message.status === "streaming" ? "prose streaming" : "prose"}>
+            <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
+          </div>
+        )
+      )}
+      {message.error && <div className="error">{message.error}</div>}
+      <Stats message={message} />
+    </div>
+  );
+}
