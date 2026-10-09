@@ -64,6 +64,15 @@ export function onProgress(steps: Step[], event: ServerProgress, now: number): S
       return steps.map((s) =>
         s.key === `tool-${event.id}` ? { ...s, state: event.ok === false ? "failed" : "done", endedAt: now } : s,
       );
+    case "cut_off": {
+      // The model's tool call ran past its output limit; the server has asked it to retry.
+      let i = steps.length - 1;
+      while (i >= 0 && !(steps[i].key.startsWith("model-") && steps[i].state === "running")) i--;
+      if (i === -1) return steps;
+      return steps.map((s, j) =>
+        j === i ? { ...s, state: "failed", endedAt: now, detail: "its tool call was too long to finish; retrying" } : s,
+      );
+    }
     case "structuring":
       return start(steps, { key: `schema-${n}`, label: event.retry ? "Filling the schema again" : "Filling the schema" }, now);
     case "reasoning":

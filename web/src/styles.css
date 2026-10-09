@@ -597,6 +597,15 @@ textarea:focus {
   margin-top: 8px;
 }
 
+.notice {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-top: 10px;
+  font-size: 14px;
+}
+
 .error.small {
   font-size: 13px;
   padding: 6px 10px;
@@ -689,6 +698,14 @@ textarea:focus {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.json pre.plain {
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.6;
+  word-break: normal;
+  overflow-wrap: anywhere;
 }
 
 .json .copy {

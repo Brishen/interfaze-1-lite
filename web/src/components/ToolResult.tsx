@@ -50,11 +50,12 @@ export function hasRichView(result: unknown, image?: string): boolean {
   return (
     (!!image && collectShapes(result).length > 0) ||
     (Array.isArray(record?.chunks) && record!.chunks.length > 0) ||
-    (Array.isArray(record?.predictions) && record!.predictions.length > 0)
+    (Array.isArray(record?.predictions) && record!.predictions.length > 0) ||
+    (typeof record?.translated_text === "string" && !!record.translated_text.trim())
   );
 }
 
-type View = "overlay" | "transcript" | "forecast" | "json";
+type View = "overlay" | "transcript" | "forecast" | "text" | "json";
 
 /** One tool's result: drawn over the image when it has boxes, tabulated when it is a transcript or series. */
 export function ToolResult({ name, result, image }: { name: string; result: unknown; image?: string }) {
@@ -62,11 +63,16 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
   const record = asRecord(result);
   const chunks = Array.isArray(record?.chunks) ? (record!.chunks as Chunk[]) : null;
   const predictions = Array.isArray(record?.predictions) ? (record!.predictions as Prediction[]) : null;
+  // Text worth reading as text: a translation, or a document's reading.
+  const text = [record?.translated_text, record?.extracted_text].find(
+    (t): t is string | string[] => (typeof t === "string" && !!t.trim()) || (Array.isArray(t) && t.length > 0),
+  );
 
   const views: View[] = [];
   if (image && shapes.length) views.push("overlay");
   if (chunks?.length) views.push("transcript");
   if (predictions?.length) views.push("forecast");
+  if (text) views.push("text");
   views.push("json");
   const [view, setView] = useState<View>(views[0]);
   const json = useMemo(() => JSON.stringify(result, null, 2), [result]);
@@ -120,6 +126,14 @@ export function ToolResult({ name, result, image }: { name: string; result: unkn
               ))}
             </tbody>
           </table>
+        )}
+        {view === "text" && text && (
+          <div className="json">
+            <button className="ghost small copy" onClick={() => copy(Array.isArray(text) ? text.join("\n\n") : text)}>
+              Copy
+            </button>
+            <pre className="plain">{Array.isArray(text) ? text.join("\n\n") : text}</pre>
+          </div>
         )}
         {view === "json" && (
           <div className="json">

@@ -46,6 +46,28 @@ class BrainError(RuntimeError):
     pass
 
 
+class ToolCallCutOff(BrainError):
+    """The model's tool call ran past the output token limit before it was complete.
+
+    vLLM reports this as finish_reason "length" with the partial call. llama-server
+    instead fails the whole response -- a 500, or an error event mid-stream -- because
+    it cannot parse the unfinished arguments, so it is recognised here and raised as
+    what it is, for the tool loop to recover from.
+    """
+
+
+_CUT_OFF_CALL = "Failed to parse tool call arguments"
+
+
+def _failure(status: int, text: str) -> Exception:
+    """The error a failed brain response stands for."""
+    if (too_long := _context_error(status, text)) is not None:
+        return too_long
+    if _CUT_OFF_CALL in text:
+        return ToolCallCutOff(text[:800])
+    return BrainError(f"brain returned {status}: {text[:800]}")
+
+
 # How each server says the prompt does not fit: vLLM, then llama-server (message, then
 # error type).
 _CONTEXT_ERRORS = ("maximum context length", "exceeds the available context size",
@@ -204,10 +226,8 @@ class BrainClient:
         )
         # The caller's input is too long for the model: their error, which a 502 told
         # them to retry.
-        if (too_long := _context_error(resp.status_code, resp.text)) is not None:
-            raise too_long
         if resp.status_code >= 400:
-            raise BrainError(f"brain returned {resp.status_code}: {resp.text[:800]}")
+            raise _failure(resp.status_code, resp.text)
         return resp.json()
 
     async def _events(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
@@ -224,9 +244,7 @@ class BrainClient:
         ) as resp:
             if resp.status_code >= 400:
                 body = (await resp.aread()).decode(errors="replace")
-                if (too_long := _context_error(resp.status_code, body)) is not None:
-                    raise too_long
-                raise BrainError(f"brain returned {resp.status_code}: {body[:800]}")
+                raise _failure(resp.status_code, body)
             async for line in resp.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -234,9 +252,13 @@ class BrainClient:
                 if data == "[DONE]":
                     return
                 try:
-                    yield json.loads(data)
+                    event = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                # A failure after the status line arrives as an error event.
+                if isinstance(event, dict) and event.get("error"):
+                    raise _failure(500, data)
+                yield event
 
     @staticmethod
     def _parse(body: dict[str, Any]) -> BrainReply:

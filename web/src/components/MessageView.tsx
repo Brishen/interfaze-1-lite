@@ -58,7 +58,7 @@ function Stats({ message }: { message: AssistantMessage }) {
     const r = u.completion_tokens_details?.reasoning_tokens;
     if (r) parts.push(`${r.toLocaleString()} reasoning`);
   }
-  if (message.finishReason && message.finishReason !== "stop") parts.push(`finish: ${message.finishReason}`);
+  if (message.finishReason && !["stop", "length"].includes(message.finishReason)) parts.push(`finish: ${message.finishReason}`);
   if (message.status === "stopped") parts.push("stopped");
   return parts.length ? <div className="stats">{parts.join(" · ")}</div> : null;
 }
@@ -115,6 +115,12 @@ export function AssistantView({ message, image }: { message: AssistantMessage; i
             <Markdown remarkPlugins={[remarkGfm]}>{message.text}</Markdown>
           </div>
         )
+      )}
+      {message.status === "done" && message.finishReason === "length" && (
+        <div className="notice">
+          The answer reached the model's output limit and was cut off.
+          {tools.some((t) => hasRichView(t.result, image)) && " The complete result is in the tool card above."}
+        </div>
       )}
       {message.error && <div className="error">{message.error}</div>}
       <Stats message={message} />

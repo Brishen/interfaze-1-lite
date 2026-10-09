@@ -2614,3 +2614,80 @@ def test_a_json_answer_after_progress_goes_in_band():
     assert deltas[1]["delta"]["content"].startswith("<precontext> ")
     assert deltas[2]["delta"]["content"] == "hi"
     assert deltas[-1]["finish_reason"] == "stop"
+
+
+_CUT_OFF_500 = {"error": {"code": 500, "message": (
+    "Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error "
+    "at line 1, column 20181: syntax error while parsing value - invalid string: missing "
+    "closing quote")}}
+
+
+def test_a_tool_call_cut_off_by_llama_server_is_retried_not_failed(client_for):
+    """llama-server fails a response whose tool call ran past the token limit, rather than
+    returning it cut off as vLLM does. The model is told and asked again."""
+    from interfaze_lite.prompts import CUT_OFF_TURN
+
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), brain_body("Translated it in parts.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["message"]["content"] == "Translated it in parts."
+    retry = fake.tool_payloads[-1]["messages"]
+    assert retry[-1] == {"role": "user", "content": CUT_OFF_TURN}
+
+
+def test_a_second_cut_off_answers_instead_of_trying_again(client_for):
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), httpx.Response(500, json=_CUT_OFF_500),
+                 brain_body("That document is too long to copy into a tool call.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    assert "too long" in resp.json()["choices"][0]["message"]["content"]
+    assert len(fake.tool_payloads) == 3
+
+
+def test_a_watched_cut_off_is_reported(client_for):
+    fake = Fake([httpx.Response(500, json=_CUT_OFF_500), brain_body("Done.")])
+    client = client_for(fake)
+    # Buffered (a schema) so the scripted 500 is served on the non-streamed path.
+    _, _, events, _ = _progress_stream(client, {
+        "stream": True, "messages": [{"role": "user", "content": "translate this into English"}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "r", "schema": {"type": "object", "properties": {"a": {"type": "number"}}}}}})
+    stages = [e["stage"] for e in events]
+    assert stages.count("model") == 2 and stages.index("cut_off") == stages.index("model") + 1
+
+
+def test_brain_failures_are_classified():
+    from interfaze_lite.brain import BrainError, ContextLengthError, ToolCallCutOff, _failure
+
+    assert isinstance(_failure(500, json.dumps(_CUT_OFF_500)), ToolCallCutOff)
+    assert isinstance(_failure(400, '{"error":{"message":"exceeds the available context size"}}'),
+                      ContextLengthError)
+    other = _failure(503, "busy")
+    assert type(other) is BrainError and "503" in str(other)
+
+
+def test_a_cut_off_call_goes_back_to_the_model_as_valid_json(client_for):
+    """A call cut off mid-string is answered as cut off, and replayed with `{}` arguments:
+    llama-server refused the next turn outright over the unparseable ones."""
+    from interfaze_lite.prompts import CUT_OFF_CALL
+
+    cut = brain_body(tool_calls=[{"id": "c1", "type": "function", "function": {
+        "name": "translate", "arguments": '{"text":"海図（かいず、英語：nautical chart）は、水路'}}])
+    cut["choices"][0]["finish_reason"] = "length"
+    fake = Fake([cut, brain_body("I translated it from the file instead.")])
+    client = client_for(fake)
+    resp = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "translate this report into English"}]})
+
+    assert resp.status_code == 200, resp.text
+    history = fake.tool_payloads[-1]["messages"]
+    call = next(m for m in history if m.get("tool_calls"))["tool_calls"][0]
+    assert call["function"] == {"name": "translate", "arguments": "{}"}
+    result = next(m for m in history if m.get("role") == "tool")
+    assert CUT_OFF_CALL in result["content"]

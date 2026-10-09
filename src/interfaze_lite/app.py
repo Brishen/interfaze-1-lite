@@ -31,7 +31,14 @@ from . import forecasting
 from . import guard as guardrails
 from . import intent
 from . import tools as toolkit
-from .brain import STRUCTURED_MAX_TEMPERATURE, BrainClient, BrainError, ContextLengthError, Sampling
+from .brain import (
+    STRUCTURED_MAX_TEMPERATURE,
+    BrainClient,
+    BrainError,
+    ContextLengthError,
+    Sampling,
+    ToolCallCutOff,
+)
 from .config import settings
 from .contracts import InputFetchError
 from .envelope import (
@@ -43,6 +50,7 @@ from .envelope import (
 )
 from .filerefs import extract_from_messages
 from .prompts import CUT_OFF_CALL as _CUT_OFF_CALL
+from .prompts import CUT_OFF_TURN as _CUT_OFF_TURN
 from .prompts import NUDGE as _NUDGE
 from .prompts import OUT_OF_STEPS as _OUT_OF_STEPS
 from .prompts import SYSTEM_PROMPT
@@ -164,14 +172,29 @@ async def _run_tool_loop(
     # last round's OCR and detection, and one receipt was detected seven times over.
     answered = _answered_calls(messages)
     repeats = 0
+    cut_offs = 0
 
     for step in range(ctx.settings.max_tool_steps):
         # Text streams live unless this turn may yet be discarded for the nudge below.
         live = on_text if (not ctx.refs.refs or used or ran or nudged) else None
         held = _Narration(live) if live else None
         _report(ctx.progress, "model", step=step + 1, after_tools=bool(used or ran))
-        reply = await brain.select_tools(messages, schemas, sampling, tool_choice=choice,
-                                         on_text=held.feed if held else None)
+        try:
+            reply = await brain.select_tools(messages, schemas, sampling, tool_choice=choice,
+                                             on_text=held.feed if held else None)
+        except ToolCallCutOff:
+            # The model wrote a call too long to finish -- a whole document copied into
+            # `text` -- and llama-server failed the response rather than return it cut off.
+            # Told so, it can call again by file reference; told twice, it will not.
+            cut_offs += 1
+            log.info("step %d: tool call cut off at the output token limit", step)
+            _report(ctx.progress, "cut_off")
+            if cut_offs >= 2:
+                return ([*messages, {"role": "user", "content": _OUT_OF_STEPS}],
+                        precontext, used, "", "stop")
+            messages = [*messages, {"role": "user", "content": _CUT_OFF_TURN}]
+            choice = "auto"
+            continue
         if held:
             held.end(called_tools=bool(reply.tool_calls))
         choice = "auto"
@@ -208,7 +231,7 @@ async def _run_tool_loop(
             {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [c.as_dict() for c in reply.tool_calls],
+                "tool_calls": [_replayable(c) for c in reply.tool_calls],
             }
         )
 
@@ -275,6 +298,23 @@ async def _run_tool_loop(
             return messages, precontext, used, "", "stop"
 
     return [*messages, {"role": "user", "content": _OUT_OF_STEPS}], precontext, used, "", "stop"
+
+
+def _replayable(call) -> dict:
+    """A tool call as it goes back to the model in the next turn's history.
+
+    Arguments that are not JSON -- a call cut off at the token limit, mid-string -- go back
+    as `{}`. llama-server parses the history's calls and refused the whole next turn over
+    one: a request to translate a long PDF failed with "Failed to parse tool call
+    arguments" after the model had copied 20,000 characters into `text`. The call's
+    result says what went wrong, so nothing the model needs is lost.
+    """
+    out = call.as_dict()
+    try:
+        json.loads(call.arguments)
+    except (TypeError, ValueError):
+        out = {**out, "function": {**out["function"], "arguments": "{}"}}
+    return out
 
 
 def _report(sink: Callable[[dict], None] | None, stage: str, **fields: Any) -> None:
