@@ -225,3 +225,6 @@ components.env
 # Weights and caches mounted into the container.
 /models/
 llamacpp/logs/
+# The web UI's dependencies, and its build (served from the package; `cd web && npm run build`).
+web/node_modules/
+src/interfaze_lite/web/

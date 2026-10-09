@@ -99,6 +99,7 @@ echo "[5/5] interfaze-1-lite on :8000"
 uvicorn interfaze_lite.app:app --host 0.0.0.0 --port 8000 &
 PIDS+=($!); wait_for "orchestrator" http://127.0.0.1:8000/health "$!" 300
 echo "ready: POST http://localhost:8000/v1/chat/completions"
+echo "       web UI: http://localhost:8000/"
 
 # If any process dies, stop the container so its restart policy brings the stack back
 # together, rather than serving with a piece missing.

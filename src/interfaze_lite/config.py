@@ -121,6 +121,11 @@ class Settings:
     admin_key: str | None = field(
         default_factory=lambda: os.environ.get("ADMIN_KEY") or os.environ.get("admin_key") or None)
 
+    # The web UI (web/, built into the package by `npm run build`), served at `/` once it
+    # has been built. WEB_DIR serves a build from elsewhere; WEB_UI=0 serves none.
+    web_ui: bool = field(default_factory=lambda: os.environ.get("WEB_UI", "1") != "0")
+    web_dir: str = field(default_factory=lambda: _env("WEB_DIR", ""))
+
     @property
     def llamacpp(self) -> bool:
         return self.brain_backend in ("llamacpp", "llama.cpp", "llama-cpp", "llama_cpp")

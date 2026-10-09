@@ -7,3 +7,5 @@ __pycache__
 tests/
 models/
 llamacpp/logs
+web/node_modules
+src/interfaze_lite/web

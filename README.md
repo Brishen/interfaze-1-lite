@@ -131,6 +131,18 @@ docker run --gpus all --ipc=host -p 8000:8000 -v "$PWD/models:/models" interfaze
 
 Scores on this path are not measured: 4-bit weights cost some accuracy against the FP8 checkpoint, most visibly on grounding and long structured extraction.
 
+### Web UI
+
+Open `http://localhost:8000/` for a chat interface built with React. Attach images, PDFs, Word files or audio (or record from the microphone), and ask. Each specialist's result appears above the answer: boxes and outlines drawn over the image, transcripts by speaker, forecasts as a table, and the raw JSON. The settings panel sets a run task, a JSON schema for structured output, guardrail categories, reasoning effort and sampling, and the API key if the server has one.
+
+Both Docker images build the UI. `llamacpp/run.sh` builds it on first start when `npm` is installed; otherwise build it once yourself (Node 20.19 or newer):
+
+```bash
+cd web && npm ci && npm run build   # writes src/interfaze_lite/web, which the server serves at /
+```
+
+To work on the UI, run `npm run dev` in `web/` against a running server: it serves on `http://localhost:5173` and forwards the API to `http://localhost:8000` (set `INTERFAZE_URL` to point elsewhere). `WEB_UI=0` turns the UI off; `WEB_DIR` serves a build from another directory.
+
 ### Call it
 
 The server speaks the OpenAI chat completions API on `http://localhost:8000/v1`:
