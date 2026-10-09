@@ -27,6 +27,11 @@ class Settings:
     # stable while the checkpoint underneath changes.
     brain_served_name: str = field(
         default_factory=lambda: _env("BRAIN_SERVED_NAME", "interfaze-lite"))
+    # What serves the brain: "vllm" (the Docker image) or "llamacpp" (llama-server with a
+    # GGUF, llamacpp/run.sh). Both speak the OpenAI API; they differ in the corners the
+    # brain client works around -- a named tool_choice, and fetching image URLs.
+    brain_backend: str = field(
+        default_factory=lambda: _env("BRAIN_BACKEND", "vllm").strip().lower())
     perception_url: str = field(
         default_factory=lambda: _env("PERCEPTION_URL", "http://127.0.0.1:8002"))
     diarize_url: str = field(
@@ -115,6 +120,10 @@ class Settings:
     # every model service. Some secret stores expose it in lowercase.
     admin_key: str | None = field(
         default_factory=lambda: os.environ.get("ADMIN_KEY") or os.environ.get("admin_key") or None)
+
+    @property
+    def llamacpp(self) -> bool:
+        return self.brain_backend in ("llamacpp", "llama.cpp", "llama-cpp", "llama_cpp")
 
     @property
     def brain_chat_url(self) -> str:

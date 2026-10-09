@@ -48,9 +48,9 @@ def test_concurrent_first_requests_build_one_model(fake_model):
 
 def test_the_named_components_load_before_traffic(fake_model, monkeypatch):
     _, loaded = fake_model
-    monkeypatch.setenv("PERCEPTION_PRELOAD", "asr_fallback, segmenter,guard,forecaster")
+    monkeypatch.setenv("PERCEPTION_PRELOAD", "asr_fallback, segmenter,forecaster")
     perception.preload()
-    assert loaded == ["asr_fallback", "segmenter", "guard", "forecaster"]
+    assert loaded == ["asr_fallback", "segmenter", "forecaster"]
 
 
 def test_nothing_loads_early_unless_asked(fake_model, monkeypatch):
@@ -69,20 +69,20 @@ def test_a_failed_request_is_collected_before_the_next_runs(monkeypatch):
         def transcribe(self, *args, **kwargs):
             raise RuntimeError("CUDA out of memory")
 
-        def moderate(self, text):
-            return {"safe": True}
+        def forecast(self, y, horizon):
+            return {"predictions": []}
 
     collected = []
     monkeypatch.setattr(perception, "model", lambda: Model())
     monkeypatch.setattr(perception.gc, "collect", lambda: collected.append(1))
     perception._failed.clear()
 
-    perception.guard(perception.GuardRequest(text="hi"))
+    perception.forecast(perception.ForecastRequest(fh=1, y={"2024-01-01": 1.0}))
     assert collected == []
     with pytest.raises(HTTPException):
         perception.transcribe(perception.TranscribeRequest(url="https://example.com/a.mp3"))
     assert collected == []
-    perception.guard(perception.GuardRequest(text="hi"))
+    perception.forecast(perception.ForecastRequest(fh=1, y={"2024-01-01": 1.0}))
     assert collected == [1]
-    perception.guard(perception.GuardRequest(text="hi"))
+    perception.forecast(perception.ForecastRequest(fh=1, y={"2024-01-01": 1.0}))
     assert collected == [1]

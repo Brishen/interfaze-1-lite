@@ -466,15 +466,9 @@ async def _run_guard(codes: list[str], messages: list[dict], refs, brain: BrainC
     """The guard's verdict on the latest user message: (safe, blocked content, precontext)."""
     text, image_urls = _latest_prompt(messages, refs)
 
-    async def text_guard() -> dict:
-        resp = await app.state.http.post(f"{settings.perception_url.rstrip('/')}/guard",
-                                         json={"text": text}, timeout=settings.tool_timeout_s)
-        resp.raise_for_status()
-        return resp.json()
-
     checks = guardrails.wants_images(codes)
     image_jobs = [brain.image_safety(url) for url in image_urls] if any(checks.values()) else []
-    verdict, *scores = await asyncio.gather(text_guard(), *image_jobs)
+    verdict, *scores = await asyncio.gather(brain.text_safety(text), *image_jobs)
 
     usage.prompt_tokens += int(verdict.get("prompt_tokens", 0))
     usage.completion_tokens += int(verdict.get("completion_tokens", 0))

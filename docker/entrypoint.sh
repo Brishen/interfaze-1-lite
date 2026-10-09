@@ -26,8 +26,8 @@ export COMPONENT_NAMES
 export HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-${hf_token:-}}}"
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 if [[ -z "${HF_TOKEN}" ]]; then
-    echo "FATAL: HF_TOKEN is unset. The diarization and guard models are gated on Hugging" >&2
-    echo "       Face; accept their terms and pass -e HF_TOKEN=hf_..." >&2
+    echo "FATAL: HF_TOKEN is unset. The diarization model is gated on Hugging Face;" >&2
+    echo "       accept its terms and pass -e HF_TOKEN=hf_..." >&2
     exit 1
 fi
 

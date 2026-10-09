@@ -15,11 +15,56 @@ dependencies = [
 [project.optional-dependencies]
 # GPU extras are installed in the Docker image, not for local contract work.
 serve = ["vllm==0.27.1"]
+# The llama.cpp deployment (llamacpp/run.sh): the reasoning core and the document reader
+# are GGUF files served by llama-server, so this is the orchestrator plus the perception
+# and diarization sidecars, without vLLM. `uv sync --extra llamacpp`.
+llamacpp = [
+    "uvicorn[standard]",
+    "fastapi[standard]",
+    "pillow",
+    "numpy",
+    "pymupdf",
+    # perception: speech, segmentation, line geometry and layout, forecasting
+    "torch",
+    "torchaudio",
+    "transformers==5.15.0",
+    "accelerate",
+    "huggingface_hub",
+    "soundfile",
+    "einops",
+    "paddleocr==3.3.2",
+    "paddlepaddle==3.2.2",
+    "opencv-python-headless>=4.13.0",
+    "sam-2 @ git+https://github.com/facebookresearch/sam2.git@2b90b9f5ceec907a1c18123530e92e794ad901a4",
+    "pandas",
+    "timesfm[torch] @ git+https://github.com/google-research/timesfm.git@bf88c5dc88f6275b7071ebcd9051406c11435c0c",
+    # the document reader's own prompt and HTML-to-markdown helper
+    "chandra-ocr>=0.2.0",
+    # diarization; gated on Hugging Face, so it needs HF_TOKEN (run.sh skips it without one)
+    "pyannote.audio",
+]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The llamacpp extra pins SAM 2 and TimesFM to git commits, as the Dockerfile does.
+allow-direct-references = true
+
+[tool.uv]
+# vLLM pins its own torch; the llama.cpp deployment never installs it.
+conflicts = [[{ extra = "serve" }, { extra = "llamacpp" }]]
+environments = ["sys_platform == 'linux'"]
+
+[tool.uv.extra-build-dependencies]
+# SAM 2's setup.py imports torch.
+sam-2 = ["torch"]
+
+[tool.uv.extra-build-variables]
+# Its optional CUDA extension only post-processes masks, and building it needs nvcc.
+sam-2 = { SAM2_BUILD_CUDA = "0" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/interfaze_lite"]

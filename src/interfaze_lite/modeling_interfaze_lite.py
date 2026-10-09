@@ -52,7 +52,7 @@ try:  # the interfaze_lite package, and this repo as trust_remote_code imports i
     from .forecasting import MAX_CONTEXT, MAX_HORIZON
     from .grounding import MAX_TOKENS as GROUND_MAX_TOKENS
     from .grounding import MAX_TOKENS_UI as GROUND_MAX_TOKENS_UI
-    from .guard import CATEGORIES as GUARD_CATEGORIES
+    from .guard import check_prompt, parse_check
     from .line_runtime import Runtime, layout_pages, line_rows
     from .prompts import NUDGE
 except ImportError:  # the files run flat, from a checkout
@@ -65,7 +65,7 @@ except ImportError:  # the files run flat, from a checkout
     from forecasting import MAX_CONTEXT, MAX_HORIZON  # type: ignore
     from grounding import MAX_TOKENS as GROUND_MAX_TOKENS  # type: ignore
     from grounding import MAX_TOKENS_UI as GROUND_MAX_TOKENS_UI  # type: ignore
-    from guard import CATEGORIES as GUARD_CATEGORIES  # type: ignore
+    from guard import check_prompt, parse_check  # type: ignore
     from line_runtime import Runtime, layout_pages, line_rows  # type: ignore
     from prompts import NUDGE  # type: ignore
 
@@ -501,20 +501,6 @@ class InterfazeLiteModel(PreTrainedModel):
         pipeline = Pipeline.from_pretrained(self._repo("diarizer"), token=_hf_token())
         return pipeline.to(self._torch_device)
 
-    def _load_guard(self):
-        """The text guard: a safety classifier answering "safe", or "unsafe" and the
-        violated categories, prompted with the S1-S14 taxonomy interfaze's guard uses."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        repo = self._repo("guard")
-        token = _hf_token()
-        return {
-            "model": AutoModelForCausalLM.from_pretrained(
-                repo, dtype=self._dtype, device_map=str(self._torch_device), token=token
-            ).eval(),
-            "tokenizer": AutoTokenizer.from_pretrained(repo, token=token),
-        }
-
     def _load_forecaster(self):
         """The time-series model, compiled exactly as JigsawStack's forecast service does:
         1,024 points of context, a 256-step horizon, flip-invariant, non-negative when
@@ -549,55 +535,19 @@ class InterfazeLiteModel(PreTrainedModel):
 
     # ---------------------------------------------------------------- guardrails
 
-    # Longer text is classified by its last this-many characters: a prompt of tens of
-    # thousands of tokens is prefilled in one pass here, on a card other models share.
-    _GUARD_MAX_CHARS = 64_000
-
     @torch.inference_mode()
     def moderate(self, text: str) -> dict:
-        """The guard's verdict on one user message: `output` is its raw answer, "safe" or
-        "unsafe" followed by a comma-separated list of codes on the next line."""
-        guard = self._component("guard")
-        tokenizer, model = guard["tokenizer"], guard["model"]
-        conversation = [
-            {"role": "user", "content": [{"type": "text", "text": (text or "")[-self._GUARD_MAX_CHARS :]}]}
-        ]
-        encoded = tokenizer.apply_chat_template(
-            conversation,
-            categories=GUARD_CATEGORIES,
-            excluded_category_keys=[],
-            return_tensors="pt",
-            return_dict=True,
-        )
-        inputs = {k: v.to(model.device) for k, v in encoded.items()}
-        prompt_len = inputs["input_ids"].shape[1]
-        out = model.generate(
-            **inputs, max_new_tokens=20, do_sample=False, pad_token_id=tokenizer.eos_token_id,
-            output_scores=True, return_dict_in_generate=True,
-        )
-        generated = out.sequences[0, prompt_len:]
-        answer = tokenizer.decode(generated, skip_special_tokens=True).strip()
+        """The guard's verdict on one user message: `output` is "safe", or "unsafe"
+        followed by a comma-separated list of codes on the next line.
 
-        # Unsafe only when the guard is sure. Its verdict is the likelier of "safe" and
-        # "unsafe", and plain file requests -- "Extract all text", "Transcribe this audio
-        # file" -- came out unsafe S8 at 0.59-0.73, blocking OCR under a guard. Every real
-        # violation tested scored 0.986 or more, every safe prompt 0.014 or less; thresholding
-        # this probability is how the guard is meant to be calibrated.
-        safe, unsafe = (tokenizer.encode(w, add_special_tokens=False)[0] for w in ("safe", "unsafe"))
-        p_unsafe = None
-        for step, token in enumerate(generated.tolist()):
-            if token in (safe, unsafe):
-                probs = torch.softmax(out.scores[step][0].float(), dim=-1)
-                p_unsafe = float(probs[unsafe] / (probs[unsafe] + probs[safe]))
-                break
-        if answer.startswith("unsafe") and p_unsafe is not None and p_unsafe < _GUARD_UNSAFE_THRESHOLD:
-            answer = "safe"
-        return {
-            "output": answer,
-            "unsafe_probability": p_unsafe,
-            "prompt_tokens": int(prompt_len),
-            "completion_tokens": int(generated.shape[0]),
-        }
+        Answered by the brain against the S1-S14 taxonomy, as the service does; there is
+        no separate guard model.
+        """
+        answer = self._brain_generate(
+            [{"role": "user", "content": [{"type": "text", "text": check_prompt(text)}]}],
+            max_new_tokens=24,
+        )
+        return {"output": parse_check(answer)}
 
     # ---------------------------------------------------------------- forecasting
 
@@ -1688,8 +1638,6 @@ _ASR_RATE = 16_000
 # for a whole recording, one 95-minute file kept every other transcription waiting ~90 s.
 _RECOGNISER = threading.Lock()
 
-# The guard's probability of "unsafe" a verdict needs to block (see `moderate`).
-_GUARD_UNSAFE_THRESHOLD = 0.8
 
 # The segmenter keeps the image it was given between set_image and predict. Two requests
 # interleaving there cut one image's masks from the other's embedding. Held for that pair

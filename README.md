@@ -34,7 +34,7 @@ Interfaze 1 Lite is not one network. It is a reasoning core plus specialists, ea
 | Diarization | Speaker segmentation and embedding pipeline | Who spoke when |
 | Segmentation | Promptable segmentation model | Object outlines and masks |
 | Forecasting | Time-series foundation model | Future values of a numeric series |
-| Guardrails | Safety classifier | 14 text safety categories |
+| Guardrails | The reasoning core | 14 text safety categories, and image safety scores |
 
 How the parts combine:
 
@@ -77,7 +77,7 @@ Interfaze 1 Lite was scored by us with each benchmark's official scorer ([evalua
 
 - One 80 GB GPU with compute capability 8.9 or newer (Hopper, Ada). Tested on an H100.
 - Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-- A Hugging Face token that can read two gated models: [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) and [Llama Guard 3](https://huggingface.co/meta-llama/Llama-Guard-3-1B). Accept their terms on Hugging Face first.
+- A Hugging Face token that can read the gated [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1). Accept its terms on Hugging Face first.
 - About 64 GB of RAM and 60 GB of disk for the weights.
 
 To run the model in Python without a server, through 🤗 Transformers, see the [Hugging Face repo](https://huggingface.co/interfaze-ai/interfaze-1-lite).
@@ -98,6 +98,38 @@ Without Compose:
 docker build -t interfaze-1-lite .
 docker run --gpus all --ipc=host -p 8000:8000 -e HF_TOKEN=hf_... -v "$PWD/models:/models" interfaze-1-lite
 ```
+
+### Run with llama.cpp (quantized, 2× 24 GB)
+
+The two language models also run as quantized GGUFs under `llama-server`, which drops the FP8 and 80 GB requirements: the default layout puts the reasoning core ([Qwen3.8-27B UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF), ~18 GB) on the first card and the document reader ([Chandra OCR 2 Q8_0](https://huggingface.co/prithivMLmods/chandra-ocr-2-GGUF), ~6 GB) and the perception models on the second. Tested on two RTX 3090s; one card of 40 GB or more also works. The speech, segmentation, layout and forecasting models have no GGUF form and run under PyTorch and Paddle as in the container.
+
+You need a CUDA build of llama.cpp with `llama-server`, and [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv sync --extra llamacpp
+LLAMA_SERVER=~/llama.cpp/build/bin/llama-server llamacpp/run.sh
+```
+
+The first start downloads the GGUFs into `~/models/interfaze` (`MODELS_DIR`). The server is ready when `curl localhost:8000/health` returns 200, and logs go to `llamacpp/logs/`. On NixOS, run `uv sync` inside `nix-shell llamacpp/shell.nix`, which supplies the libraries the PyTorch and Paddle wheels expect; `run.sh` enters that shell by itself.
+
+| Variable | Default | |
+|---|---|---|
+| `LLAMA_SERVER` | `~/llama.cpp/build-cuda-native/bin/llama-server` | The `llama-server` binary. |
+| `BRAIN_GGUF`, `BRAIN_MMPROJ` | `Qwen3.8-27B-UD-Q4_K_XL.gguf`, `mmproj-BF16.gguf` | A file name from `BRAIN_REPO` (downloaded if missing) or an absolute path. A larger quant such as `UD-Q5_K_XL` is closer to the FP8 checkpoint the scores above were measured on. |
+| `OCR_GGUF`, `OCR_MMPROJ` | `chandra-ocr-2.Q8_0.gguf`, `chandra-ocr-2.mmproj-f16.gguf` | The same, from `OCR_REPO`. |
+| `BRAIN_DEVICE`, `OCR_DEVICE`, `SIDECAR_GPU` | `CUDA0`, `CUDA1`, `1` | Placement; with one GPU, all on the first. |
+| `BRAIN_CTX`, `BRAIN_PARALLEL` | `65536`, `4` | Context window, shared by the parallel slots. |
+| `BRAIN_ARGS_EXTRA`, `OCR_ARGS_EXTRA` | – | Extra `llama-server` flags, for example speculative decoding. |
+| `HF_TOKEN` | – | Optional here: only speaker attribution needs it. |
+
+Without a local llama.cpp build, the same stack runs in a container on llama.cpp's CUDA image:
+
+```bash
+docker build -f llamacpp/Dockerfile -t interfaze-1-lite:llamacpp .
+docker run --gpus all --ipc=host -p 8000:8000 -v "$PWD/models:/models" interfaze-1-lite:llamacpp
+```
+
+Scores on this path are not measured: 4-bit weights cost some accuracy against the FP8 checkpoint, most visibly on grounding and long structured extraction.
 
 ### Call it
 
@@ -266,4 +298,4 @@ print(res.choices[0].message.content)
 
 ## Thank you
 
-We are grateful for the inspiration from these models and the teams behind them: [Qwen3.8 27B](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) from the Qwen team, [Chandra OCR 2](https://huggingface.co/datalab-to/chandra-ocr-2) from Datalab, [Whisper large-v3 turbo](https://huggingface.co/openai/whisper-large-v3-turbo) from OpenAI, [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) from pyannote, [SAM 2.1](https://huggingface.co/facebook/sam2.1-hiera-large) and [Llama Guard 3](https://huggingface.co/meta-llama/Llama-Guard-3-1B) from Meta, [TimesFM 2.5](https://huggingface.co/google/timesfm-2.5-200m-pytorch) from Google Research, and [PP-OCRv5 detection](https://huggingface.co/PaddlePaddle/PP-OCRv5_server_det), [PP-OCRv5 recognition](https://huggingface.co/PaddlePaddle/en_PP-OCRv5_mobile_rec) and [PP-DocLayout](https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L) from PaddlePaddle. Thanks also to the open-source projects that run them: [vLLM](https://github.com/vllm-project/vllm), [Hugging Face Transformers](https://github.com/huggingface/transformers), [pyannote.audio](https://github.com/pyannote/pyannote-audio), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [SAM 2](https://github.com/facebookresearch/sam2) and [TimesFM](https://github.com/google-research/timesfm).
+We are grateful for the inspiration from these models and the teams behind them: [Qwen3.8 27B](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) from the Qwen team, [Chandra OCR 2](https://huggingface.co/datalab-to/chandra-ocr-2) from Datalab, [Whisper large-v3 turbo](https://huggingface.co/openai/whisper-large-v3-turbo) from OpenAI, [speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) from pyannote, [SAM 2.1](https://huggingface.co/facebook/sam2.1-hiera-large) from Meta, [TimesFM 2.5](https://huggingface.co/google/timesfm-2.5-200m-pytorch) from Google Research, and [PP-OCRv5 detection](https://huggingface.co/PaddlePaddle/PP-OCRv5_server_det), [PP-OCRv5 recognition](https://huggingface.co/PaddlePaddle/en_PP-OCRv5_mobile_rec) and [PP-DocLayout](https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L) from PaddlePaddle. Thanks also to the open-source projects that run them: [vLLM](https://github.com/vllm-project/vllm), [llama.cpp](https://github.com/ggml-org/llama.cpp), [Hugging Face Transformers](https://github.com/huggingface/transformers), [pyannote.audio](https://github.com/pyannote/pyannote-audio), [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR), [SAM 2](https://github.com/facebookresearch/sam2) and [TimesFM](https://github.com/google-research/timesfm).
