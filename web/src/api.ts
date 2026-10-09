@@ -95,77 +95,161 @@ export function buildBody(model: string, history: Message[], settings: Settings)
   return body;
 }
 
+/** A step the server reports while it works (`x-interfaze-progress`). */
+export type ServerProgress = { stage: string; [field: string]: unknown };
+
 export type StreamUpdate =
+  | { type: "upload"; sent: number; total: number }
+  | { type: "uploaded" }
+  | { type: "progress"; event: ServerProgress }
   | { type: "content"; text: string }
   | { type: "finish"; reason: string; usage?: Usage };
 
+/** Callback events turned into an async iterator. */
+class Channel<T> {
+  private items: T[] = [];
+  private wake: (() => void) | null = null;
+  private closed = false;
+  private failure: unknown = null;
+
+  push(item: T) {
+    this.items.push(item);
+    this.wake?.();
+  }
+
+  close(failure: unknown = null) {
+    if (this.closed) return;
+    this.closed = true;
+    this.failure = failure;
+    this.wake?.();
+  }
+
+  async *drain(): AsyncGenerator<T> {
+    for (;;) {
+      while (this.items.length) yield this.items.shift()!;
+      if (this.closed) {
+        if (this.failure) throw this.failure;
+        return;
+      }
+      await new Promise<void>((resolve) => (this.wake = resolve));
+      this.wake = null;
+    }
+  }
+}
+
+function errorMessage(status: number, text: string): string {
+  try {
+    const err = JSON.parse(text);
+    return err?.error?.message ?? err?.detail ?? `${status}`;
+  } catch {
+    return `The server answered ${status}.`;
+  }
+}
+
 /**
- * POST a streamed chat completion and yield its deltas.
+ * POST a streamed chat completion and yield its deltas, with the request's progress.
  *
- * `x-show-additional-info` asks the server to put each tool's result in the stream,
- * wrapped in `<precontext> ... </precontext>` inside `content`; `splitPrecontext`
- * takes those back out.
+ * XMLHttpRequest rather than fetch: only it reports how much of a large upload has been
+ * sent. `x-show-additional-info` puts each tool's result in the stream inside
+ * `<precontext> ... </precontext>` (see `splitPrecontext`); `x-interfaze-progress` adds
+ * `: progress {...}` comment lines as the server plans, runs tools and writes.
  */
 export async function* streamChat(
   settings: Settings,
   body: Record<string, unknown>,
   signal: AbortSignal,
 ): AsyncGenerator<StreamUpdate> {
-  const res = await fetch(`${base(settings)}/v1/chat/completions`, {
-    method: "POST",
-    headers: { ...headers(settings), "x-show-additional-info": "true" },
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok) {
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const err = await res.json();
-      message = err?.error?.message ?? err?.detail ?? message;
-    } catch {
-      /* not JSON */
-    }
-    throw new ApiError(message);
-  }
-  if (!res.body) throw new ApiError("The server sent no response body.");
+  const channel = new Channel<StreamUpdate>();
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `${base(settings)}/v1/chat/completions`);
+  for (const [k, v] of Object.entries(headers(settings))) xhr.setRequestHeader(k, v);
+  xhr.setRequestHeader("x-show-additional-info", "true");
+  xhr.setRequestHeader("x-interfaze-progress", "true");
 
-  // A server can answer a stream request with plain JSON; take it whole.
-  if (!(res.headers.get("content-type") ?? "").includes("event-stream")) {
-    const whole = await res.json();
-    const choice = whole?.choices?.[0];
-    const precontext = whole?.precontext as PrecontextItem[] | undefined;
-    if (precontext?.length) {
-      yield { type: "content", text: `<precontext> ${JSON.stringify(precontext)} </precontext>` };
-    }
-    if (choice?.message?.content) yield { type: "content", text: choice.message.content };
-    yield { type: "finish", reason: choice?.finish_reason ?? "stop", usage: whole?.usage };
-    return;
-  }
-
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let seen = 0;
   let buffer = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += value;
+  let finished = false;
+  const isStream = () => (xhr.getResponseHeader("content-type") ?? "").includes("event-stream");
+
+  const parse = (final: boolean) => {
+    buffer += xhr.responseText.slice(seen);
+    seen = xhr.responseText.length;
+    if (final && buffer.trim()) buffer += "\n\n";
     let boundary: number;
     while ((boundary = buffer.indexOf("\n\n")) !== -1) {
       const event = buffer.slice(0, boundary);
       buffer = buffer.slice(boundary + 2);
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (!data) continue;
-      if (data === "[DONE]") return;
-      const chunk = JSON.parse(data);
+      const data: string[] = [];
+      for (const line of event.split("\n")) {
+        if (line.startsWith(": progress ")) {
+          try {
+            channel.push({ type: "progress", event: JSON.parse(line.slice(11)) });
+          } catch {
+            /* a progress line is a courtesy; a bad one is skipped */
+          }
+        } else if (line.startsWith("data:")) {
+          data.push(line.slice(5).trimStart());
+        }
+      }
+      const payload = data.join("\n");
+      if (!payload) continue;
+      if (payload === "[DONE]") {
+        finished = true;
+        continue;
+      }
+      const chunk = JSON.parse(payload);
       if (chunk.error) throw new ApiError(chunk.error.message ?? "The response failed while streaming.");
       const choice = chunk.choices?.[0];
       const text = choice?.delta?.content;
-      if (text) yield { type: "content", text };
-      if (choice?.finish_reason) yield { type: "finish", reason: choice.finish_reason, usage: chunk.usage };
+      if (text) channel.push({ type: "content", text });
+      if (choice?.finish_reason) channel.push({ type: "finish", reason: choice.finish_reason, usage: chunk.usage });
     }
+  };
+
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) channel.push({ type: "upload", sent: e.loaded, total: e.total });
+  };
+  xhr.upload.onload = () => channel.push({ type: "uploaded" });
+  xhr.onprogress = () => {
+    if (xhr.status >= 400 || !isStream()) return;
+    try {
+      parse(false);
+    } catch (e) {
+      channel.close(e);
+      xhr.abort();
+    }
+  };
+  xhr.onload = () => {
+    try {
+      if (xhr.status >= 400) throw new ApiError(errorMessage(xhr.status, xhr.responseText));
+      if (isStream()) {
+        parse(true);
+      } else {
+        // A server can answer a stream request with plain JSON; take it whole.
+        const whole = JSON.parse(xhr.responseText);
+        const choice = whole?.choices?.[0];
+        const precontext = whole?.precontext as PrecontextItem[] | undefined;
+        if (precontext?.length) {
+          channel.push({ type: "content", text: `<precontext> ${JSON.stringify(precontext)} </precontext>` });
+        }
+        if (choice?.message?.content) channel.push({ type: "content", text: choice.message.content });
+        channel.push({ type: "finish", reason: choice?.finish_reason ?? "stop", usage: whole?.usage });
+        finished = true;
+      }
+      channel.close(finished ? null : new ApiError("The response ended before it was complete."));
+    } catch (e) {
+      channel.close(e);
+    }
+  };
+  xhr.onerror = () => channel.close(new TypeError("network error"));
+  xhr.onabort = () => channel.close(new DOMException("Aborted", "AbortError"));
+  signal.addEventListener("abort", () => xhr.abort(), { once: true });
+
+  xhr.send(JSON.stringify(body));
+  try {
+    yield* channel.drain();
+  } finally {
+    if (xhr.readyState !== XMLHttpRequest.DONE) xhr.abort();
   }
 }
 
@@ -187,4 +271,21 @@ export function splitPrecontext(raw: string): { text: string; items: PrecontextI
   const open = text.indexOf("<precontext>");
   if (open !== -1) text = text.slice(0, open);
   return { text: text.replace(/^\s+/, ""), items };
+}
+
+/**
+ * The model's reasoning, which the server sends inside the content wrapped in
+ * `<think> ... </think>`, apart from the answer. `thinking` is true while the block is
+ * still open, i.e. the model is still reasoning.
+ */
+export function splitThinking(text: string): { reasoning: string; answer: string; thinking: boolean } {
+  const open = text.indexOf("<think>");
+  if (open === -1) return { reasoning: "", answer: text, thinking: false };
+  const close = text.indexOf("</think>", open);
+  if (close === -1) return { reasoning: text.slice(open + 7).trimStart(), answer: text.slice(0, open), thinking: true };
+  return {
+    reasoning: text.slice(open + 7, close).trim(),
+    answer: (text.slice(0, open) + text.slice(close + 8)).trimStart(),
+    thinking: false,
+  };
 }

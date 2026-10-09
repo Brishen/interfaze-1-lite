@@ -44,6 +44,16 @@ function copy(text: string) {
   area.remove();
 }
 
+/** Whether a result has more to show than its JSON: boxes to draw, a transcript, a series. */
+export function hasRichView(result: unknown, image?: string): boolean {
+  const record = asRecord(result);
+  return (
+    (!!image && collectShapes(result).length > 0) ||
+    (Array.isArray(record?.chunks) && record!.chunks.length > 0) ||
+    (Array.isArray(record?.predictions) && record!.predictions.length > 0)
+  );
+}
+
 type View = "overlay" | "transcript" | "forecast" | "json";
 
 /** One tool's result: drawn over the image when it has boxes, tabulated when it is a transcript or series. */
